@@ -1,4 +1,6 @@
 // Blog Broadcast domain: the one home for "an email blast of a blog post."
+// Admin quick emails reuse its draft path (createDraftEmail) for one-off
+// announcements that are not blog posts.
 //
 // It owns the blog_broadcast_sends table, the blast lifecycle, the idempotency
 // rule, and all orchestration with Resend (the email provider). Routes and the
@@ -268,11 +270,10 @@ export async function createBroadcast({ env = {}, fetcher = fetch, audienceId, f
   return broadcastId;
 }
 
-// Create a Resend draft only. This intentionally does not call /send and does
-// not write a send-log row, because no mail has been accepted for delivery.
-export async function createDraftBroadcast({ slug, subject, name, html, env = {}, fetcher = fetch } = {}) {
-  const normalizedSlug = String(slug || '').trim();
-  if (!normalizedSlug) throw httpError('A post slug is required.', 400);
+// Create a Resend draft of an already-rendered email (a blog post or an admin
+// quick email). This intentionally does not call /send and does not write a
+// send-log row, because no mail has been accepted for delivery.
+export async function createDraftEmail({ subject, name, html, env = {}, fetcher = fetch } = {}) {
   const { from, replyTo } = resolveBroadcastConfig(env);
   const draftSegment = await resolveDraftSegmentId({ env, fetcher });
   const broadcastId = await createBroadcast({
@@ -286,7 +287,6 @@ export async function createDraftBroadcast({ slug, subject, name, html, env = {}
     html,
   });
   return {
-    slug: normalizedSlug,
     broadcastId,
     status: BROADCAST_STATUS.DRAFT,
     scheduled: false,
@@ -296,6 +296,13 @@ export async function createDraftBroadcast({ slug, subject, name, html, env = {}
     needsRecipientReview: true,
     warning: 'Created a Resend draft only. No send or schedule call was made; review/change recipients in Resend before sending.',
   };
+}
+
+// Create a Resend draft for a blog post blast.
+export async function createDraftBroadcast({ slug, subject, name, html, env = {}, fetcher = fetch } = {}) {
+  const normalizedSlug = String(slug || '').trim();
+  if (!normalizedSlug) throw httpError('A post slug is required.', 400);
+  return { slug: normalizedSlug, ...(await createDraftEmail({ subject, name, html, env, fetcher })) };
 }
 
 // Send (or schedule) an already-created broadcast.

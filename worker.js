@@ -34,6 +34,9 @@ import * as submissions from './functions/api/submissions.js';
 import * as subscribe from './functions/api/subscribe.js';
 import * as helperInterest from './functions/api/helper-interest.js';
 import * as blogBroadcast from './functions/api/blog/broadcast.js';
+import * as adminQuickEmail from './functions/api/admin/quick-email.js';
+import * as adminQuickEmailImages from './functions/api/admin/quick-email/images.js';
+import * as emailImage from './functions/api/email-images/[name].js';
 import { reconcileBroadcastSends } from './functions/_lib/domain/blog-broadcast.js';
 import { getDb, getEvent, handleErrors, listEventInstances, listPublishedEventPhotos, renderEventPageHtml } from './functions/_lib/event-platform.js';
 import * as upload from './functions/api/upload.js';
@@ -117,6 +120,19 @@ function matchApiRoute(pathname) {
 
   if (pathname === '/api/admin/audit') {
     return { routeModule: adminAudit, params: {} };
+  }
+
+  if (pathname === '/api/admin/quick-email') {
+    return { routeModule: adminQuickEmail, params: {} };
+  }
+
+  if (pathname === '/api/admin/quick-email/images') {
+    return { routeModule: adminQuickEmailImages, params: {} };
+  }
+
+  const emailImageMatch = pathname.match(/^\/api\/email-images\/([^/]+)$/);
+  if (emailImageMatch) {
+    return { routeModule: emailImage, params: { name: decodeURIComponent(emailImageMatch[1]) } };
   }
 
   if (pathname === '/api/admin/physical-resources' || pathname === '/api/admin/physical-resources/') {
