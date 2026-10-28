@@ -36,12 +36,12 @@ The blog is a manual list of static HTML pages. No build step, no database.
 
 ## Why the markers?
 
-- `<!-- POST:START -->` … `<!-- POST:END -->` delimit the article body so the email-blast
-  step (see `functions/api/blog/broadcast.js`) can reuse the exact post content without
-  pulling in the nav, footer, or CTA chrome.
+- `<!-- POST:START -->` … `<!-- POST:END -->` delimit the article body so the admin email
+  composer ("Start from" a post, via `GET /api/admin/quick-email/post`) can reuse the exact
+  post content without pulling in the nav, footer, or CTA chrome.
 - `<!-- CTA:START -->` … `<!-- CTA:END -->` mark the "next event" call to action that
   every post must carry.
-- Blog email blasts add their own platform-owned CTA block automatically. The email
+- Emails add their own platform-owned CTA block automatically. The email
   renderer always appends an upcoming-events button plus: "Want to highlight
   something on the Hack the Valley blog? Reply to this email..." so authors do not
   have to remember this per post.

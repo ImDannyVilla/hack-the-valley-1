@@ -8,6 +8,7 @@ import {
 import { absolutizeUrls, buildBroadcastEmailHtml } from '../../_shared/blog-broadcast.js';
 import { QUICK_EMAIL_LIMITS, quickEmailBodyHtml } from '../../_shared/quick-email.js';
 import { createDraftEmail } from '../../_lib/domain/blog-broadcast.js';
+import { loadBlogPost } from '../../_lib/domain/blog-post.js';
 
 function httpError(message, status) {
   return Object.assign(new Error(message), { status });
@@ -24,10 +25,12 @@ function text(value, label, max, { required = false } = {}) {
   return trimmed;
 }
 
-// POST /api/admin/quick-email  { subject, heading?, message, dryRun? }
-// Admin-only. Renders a one-off announcement in the same email chrome as blog
-// blasts and creates a Resend draft. Like blog emails, there is deliberately no
-// send/schedule mode: recipients are reviewed and the send happens in Resend.
+// POST /api/admin/quick-email  { subject, heading?, message, postSlug?, dryRun? }
+// Admin-only. Renders an email in the shared broadcast chrome and creates a
+// Resend draft. postSlug marks an email started from a blog post: the post
+// must exist, and the email links back to it ("Read this on the web"). There
+// is deliberately no send/schedule mode: recipients are reviewed and the send
+// happens in Resend.
 export async function onRequestPost(context) {
   return handleErrors(async () => {
     await requireAdmin(context.request, context.env);
@@ -37,13 +40,16 @@ export async function onRequestPost(context) {
     const subject = text(input.subject, 'Subject', QUICK_EMAIL_LIMITS.subject, { required: true });
     const heading = text(input.heading, 'Heading', QUICK_EMAIL_LIMITS.heading);
     const message = text(input.message, 'Message', QUICK_EMAIL_LIMITS.message, { required: true });
+    const postSlug = text(input.postSlug, 'Post', 200);
+    const post = postSlug ? await loadBlogPost(env.ASSETS, postSlug, { origin: new URL(request.url).origin }) : null;
 
-    // Uploaded images are referenced root-relative (/api/email-images/...);
-    // email clients need absolute URLs.
+    // Uploaded images and post links are root-relative (/api/email-images/...,
+    // /blog/...); email clients need absolute URLs.
     const base = baseUrl(request, env);
     const html = buildBroadcastEmailHtml({
       title: heading || subject,
       contentHtml: absolutizeUrls(quickEmailBodyHtml(message), base),
+      postUrl: post ? post.webUrl(base) : undefined,
       eventsUrl: `${base}/events`,
     });
 
@@ -53,7 +59,7 @@ export async function onRequestPost(context) {
 
     const result = await createDraftEmail({
       subject,
-      name: `Quick email: ${subject}`,
+      name: post ? post.broadcastName() : `Quick email: ${subject}`,
       html,
       env,
       fetcher: context.fetch || fetch,

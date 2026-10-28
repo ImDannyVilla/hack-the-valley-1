@@ -819,19 +819,20 @@ test("admin page lists event instances as flat rows without dropdowns", () => {
   assert.doesNotMatch(html, /signup\.notes/);
 });
 
-test("admin page exposes blog draft-only controls", () => {
+test("admin page has one draft-only email composer that can start from a blog post", () => {
   const html = readFileSync(new URL("../public/admin.html", import.meta.url), "utf8");
-  assert.match(html, /Blog email draft/);
+  const composer = readFileSync(new URL("../public/admin-quick-email.js", import.meta.url), "utf8");
+  assert.doesNotMatch(html, /id="blog-blast"|Blog email draft|blogBlastPayload|Past sends/);
+  assert.match(html, /id="quick-email-start"/);
   assert.match(html, /Create Resend draft/);
-  assert.match(html, /id="blog-create-draft"/);
-  assert.match(html, /blogBlastPayload\(\)/);
-  assert.match(html, /Nothing will be sent or scheduled from HTV admin/);
-  assert.doesNotMatch(html, /createDraft: true/);
-  assert.doesNotMatch(html, /id="blog-schedule-date" type="date"/);
-  assert.doesNotMatch(html, /id="blog-schedule-time" type="time"/);
-  assert.doesNotMatch(html, /Schedule send/);
-  assert.doesNotMatch(html, /Send now/);
-  assert.doesNotMatch(html, /sendBlogBlast/);
+  assert.match(composer, /\/api\/admin\/quick-email\/post\?slug=/);
+  assert.match(composer, /Nothing will be sent or scheduled from HTV admin/);
+  for (const source of [html, composer]) {
+    assert.doesNotMatch(source, /createDraft: true/);
+    assert.doesNotMatch(source, /Schedule send/);
+    assert.doesNotMatch(source, /Send now/);
+    assert.doesNotMatch(source, /sendBlogBlast/);
+  }
 });
 
 test("public event signup form skips profile fields for signed-in users and keeps anonymous form fields", () => {
@@ -1515,7 +1516,7 @@ test("wrangler runs the Worker before event page asset routing", () => {
   assert.match(config, /run_worker_first\s*=\s*\[[^\]]*"\/api\/\*"[^\]]*"\/events\/\*"[^\]]*\]/);
 });
 
-test("blog broadcast reconciliation cron runs once daily", () => {
+test("daily cron (sponsorship reminders) runs once a day", () => {
   const config = readFileSync(new URL("../wrangler.toml", import.meta.url), "utf8");
   assert.match(config, /crons\s*=\s*\["0 15 \* \* \*"\]/);
   assert.doesNotMatch(config, /\*\/15 \* \* \* \*/);

@@ -3,11 +3,9 @@
 // All the incidental complexity of how a post is stored lives in here and is
 // hidden behind behavior. Today a post is a static HTML page whose body is
 // delimited by HTML-comment markers and listed in posts.json — but callers
-// never see that. They load a BlogPost and ask it for its body / email, so the
+// never see that. They load a BlogPost and ask it for its body / web URL, so the
 // storage format can be swapped later (frontmatter, a CMS, a database) by
 // changing only this file.
-
-import { absolutizeUrls, buildBroadcastEmailHtml } from '../../_shared/blog-broadcast.js';
 
 // Implementation detail: where a post's body starts/ends. PRIVATE on purpose —
 // nothing outside this module should know posts use comment markers.
@@ -49,27 +47,10 @@ export class BlogPost {
     return `${String(baseUrl || '').replace(/\/+$/, '')}/blog/${encodeURIComponent(this.slug)}`;
   }
 
-  // Subject line for an email blast of this post (caller may override).
-  subjectLine(override) {
-    return String(override || this.title || 'Hack the Valley update').trim().slice(0, 200);
-  }
-
-  // Resend broadcast name (internal label, not shown to recipients).
+  // Resend broadcast name (internal label, not shown to recipients) for an
+  // email started from this post.
   broadcastName() {
     return `Blog: ${this.title || this.slug}`;
-  }
-
-  // Render this post as the HTML of an email blast. The body extraction and the
-  // root-relative→absolute URL rewrite are encapsulated here; callers just ask
-  // the post to render itself.
-  toEmailHtml({ baseUrl } = {}) {
-    const base = String(baseUrl || '').replace(/\/+$/, '');
-    return buildBroadcastEmailHtml({
-      title: this.title || this.subjectLine(),
-      contentHtml: absolutizeUrls(this.body(), base),
-      postUrl: this.webUrl(base),
-      eventsUrl: `${base}/events`,
-    });
   }
 }
 

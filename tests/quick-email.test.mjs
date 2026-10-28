@@ -5,11 +5,13 @@ import { readFileSync } from 'node:fs';
 import worker from '../worker.js';
 import {
   EMAIL_IMAGE_MAX_BYTES,
+  EMAIL_IMAGE_WIDTH,
   QUICK_EMAIL_FIELDS,
   emailImageKey,
   prepareEmailImageUpload,
   quickEmailBodyHtml,
 } from '../functions/_shared/quick-email.js';
+import * as composer from '../public/admin-quick-email.js';
 import { createDraftEmail } from '../functions/_lib/domain/blog-broadcast.js';
 import { onRequestPost, onRequest } from '../functions/api/admin/quick-email.js';
 import { onRequestPost as uploadImage } from '../functions/api/admin/quick-email/images.js';
@@ -132,6 +134,27 @@ test('quickEmailBodyHtml renders an "![alt](url)" line as its own image', () => 
     `<p>Flyer below:</p>\n<p><img src="/api/email-images/${IMAGE_NAME}" alt="Hack Hours flyer"></p>\n<p>See you!</p>`,
   );
   assert.match(quickEmailBodyHtml('![Logo](https://hackthevalley.org/images/logo.png)'), /<img src="https:\/\/hackthevalley\.org\/images\/logo\.png" alt="Logo">/);
+});
+
+test('quickEmailBodyHtml sizes images with {width=N}, clamped to the email body width', () => {
+  assert.equal(quickEmailBodyHtml('![Flyer](/a.png){width=360}'), '<p><img src="/a.png" alt="Flyer" width="360"></p>');
+  assert.match(quickEmailBodyHtml('![Flyer](/a.png){width=20}'), new RegExp(`width="${EMAIL_IMAGE_WIDTH.min}"`));
+  assert.match(quickEmailBodyHtml('![Flyer](/a.png){width=9999}'), new RegExp(`width="${EMAIL_IMAGE_WIDTH.max}"`));
+});
+
+test('quickEmailBodyHtml renders ## headings, [text](url) links, and **bold**', () => {
+  assert.equal(
+    quickEmailBodyHtml('## What it does\n### Details\nRead **this** [on the blog](/blog/x) or https://a.org.'),
+    '<h2>What it does</h2>\n<h3>Details</h3>\n<p>Read <strong>this</strong> <a href="/blog/x">on the blog</a> or <a href="https://a.org">https://a.org</a>.</p>',
+  );
+});
+
+test('quickEmailBodyHtml escapes link text and refuses unsafe link targets', () => {
+  const html = quickEmailBodyHtml('[<b>x</b>](https://a.org/?q=1&r=2) [bad](javascript:alert(1)) [proto](//evil.example) **<i>y</i>**');
+  assert.match(html, /<a href="https:\/\/a\.org\/\?q=1&amp;r=2">&lt;b&gt;x&lt;\/b&gt;<\/a>/);
+  assert.match(html, /\[bad\]\(javascript:alert\(1\)\)/);
+  assert.match(html, /\[proto\]\(\/\/evil\.example\)/);
+  assert.match(html, /<strong>&lt;i&gt;y&lt;\/i&gt;<\/strong>/);
 });
 
 test('quickEmailBodyHtml escapes image alt text and refuses non-http image sources', () => {
@@ -325,6 +348,48 @@ test('quick email dry run makes uploaded image URLs absolute and sizes them for 
   assert.match(body.html, new RegExp(`<img style="max-width:100%[^"]*" src="https://hackthevalley\\.org/api/email-images/${IMAGE_NAME}" alt="Flyer">`));
 });
 
+const POST_ASSETS = {
+  async fetch(request) {
+    const path = new URL(request.url).pathname;
+    if (path === '/blog/posts.json') return Response.json({ posts: [{ slug: 'spotlight', title: 'Project Spotlight' }] });
+    if (path === '/blog/spotlight') return new Response('<!-- POST:START --><p>Body</p><!-- POST:END -->');
+    return new Response('not found', { status: 404 });
+  },
+};
+
+test('an email started from a blog post links back to the post and is named after it', async () => {
+  const preview = await onRequestPost({
+    request: quickEmailRequest({ subject: 's', message: 'Read [the post](/blog/spotlight).', postSlug: 'spotlight', dryRun: true }, { cookie: 'htv_session=tok' }),
+    env: { HTV_DB: adminDb(), ASSETS: POST_ASSETS },
+  });
+  const previewBody = await preview.json();
+  assert.match(previewBody.html, /<a href="https:\/\/hackthevalley\.org\/blog\/spotlight">the post<\/a>/);
+  assert.match(previewBody.html, /Read this on the web: <a href="https:\/\/hackthevalley\.org\/blog\/spotlight"/);
+
+  const calls = [];
+  const draft = await onRequestPost({
+    request: quickEmailRequest({ subject: 's', message: 'm', postSlug: 'spotlight' }, { cookie: 'htv_session=tok' }),
+    env: { HTV_DB: adminDb(), ASSETS: POST_ASSETS, ...RESEND_ENV },
+    fetch: mockFetch([
+      { status: 200, body: { data: [{ id: 'seg_general', name: 'General' }] } },
+      { status: 200, body: { id: 'bc_post' } },
+    ], calls),
+  });
+  assert.equal(draft.status, 200);
+  assert.equal(JSON.parse(calls[1].init.body).name, 'Blog: Project Spotlight');
+});
+
+test('an email for an unknown blog post is refused before anything reaches Resend', async () => {
+  const calls = [];
+  const response = await onRequestPost({
+    request: quickEmailRequest({ subject: 's', message: 'm', postSlug: 'missing' }, { cookie: 'htv_session=tok' }),
+    env: { HTV_DB: adminDb(), ASSETS: POST_ASSETS, ...RESEND_ENV },
+    fetch: mockFetch([], calls),
+  });
+  assert.equal(response.status, 404);
+  assert.equal(calls.length, 0);
+});
+
 test('quick email heading overrides the email title but not the subject', async () => {
   const response = await onRequestPost({
     request: quickEmailRequest({ subject: 'Subject line', heading: 'Big heading', message: 'm', dryRun: true }, { cookie: 'htv_session=tok' }),
@@ -378,24 +443,143 @@ test('quick email route only accepts POST', async () => {
 
 // --- admin UI --------------------------------------------------------------
 
-test('admin page exposes draft-only quick email controls', () => {
-  const html = readFileSync(new URL('../public/admin.html', import.meta.url), 'utf8');
+const adminHtml = () => readFileSync(new URL('../public/admin.html', import.meta.url), 'utf8');
+const composerJs = () => readFileSync(new URL('../public/admin-quick-email.js', import.meta.url), 'utf8');
+
+test('admin page exposes a draft-only quick email composer', () => {
+  const html = adminHtml();
   const start = html.indexOf('id="quick-email"');
   const section = html.slice(start, html.indexOf('</section>', start));
   assert.ok(start > 0, 'missing quick email section');
   assert.match(section, /data-admin-section="blog"/);
-  assert.match(section, /Quick email draft/);
+  assert.match(section, /Email draft/);
+  assert.match(section, /id="quick-email-start"[^>]*>\s*<option value="">Blank message<\/option>/);
+  assert.match(section, /id="quick-email-editor" contenteditable="true"/);
+  assert.doesNotMatch(section, /<textarea/);
   assert.match(section, /id="quick-email-create-draft"/);
-  assert.match(html, /api\("\/api\/admin\/quick-email"/);
   assert.match(html, /"quick-email": "blog"/);
-  assert.doesNotMatch(section, /Send now|Schedule send|type="date"|type="time"/);
+  assert.match(html, /<script type="module" src="\/admin-quick-email\.js"><\/script>/);
+  const js = composerJs();
+  assert.match(js, /postJson\('\/api\/admin\/quick-email'/);
+  assert.match(js, /Nothing will be sent or scheduled from HTV admin/);
+  for (const source of [section, js]) {
+    assert.doesNotMatch(source, /Send now|Schedule send|scheduledAt|sendNow/);
+  }
 });
 
-test('admin quick email insert buttons use the same Resend fields as the renderer docs', () => {
-  const html = readFileSync(new URL('../public/admin.html', import.meta.url), 'utf8');
-  const tokens = [...html.matchAll(/data-quick-email-insert="([^"]+)"/g)].map((match) => match[1]);
-  assert.deepEqual(tokens, QUICK_EMAIL_FIELDS.map((field) => field.token));
+test('admin insert buttons are draggable chips for the Resend fields', () => {
+  const html = adminHtml();
+  const buttons = [...html.matchAll(/<button type="button" draggable="true" data-quick-email-insert="([^"]+)"[^>]*class="qe-chip">([^<]+)<\/button>/g)]
+    .map((match) => ({ label: match[2], token: match[1] }));
+  assert.deepEqual(buttons, QUICK_EMAIL_FIELDS.map(({ label, token }) => ({ label, token })));
   assert.match(html, /id="quick-email-image-file" type="file" accept="image\/png,image\/jpeg,image\/gif,image\/webp"/);
-  assert.match(html, /fetch\("\/api\/admin\/quick-email\/images"/);
-  assert.doesNotMatch(html, /FIRST_NAME/, 'use Resend contact.* fields, not legacy FIRST_NAME');
+  assert.match(composerJs(), /fetch\('\/api\/admin\/quick-email\/images'/);
+  assert.doesNotMatch(html + composerJs(), /FIRST_NAME/, 'use Resend contact.* fields, not legacy FIRST_NAME');
+});
+
+// --- admin composer (public/admin-quick-email.js) --------------------------
+
+const textNode = (value) => ({ nodeType: 3, nodeName: '#text', nodeValue: value });
+// Like a browser NodeList: iterable with length/item(), but no array methods.
+const nodeList = (items) => ({ length: items.length, item: (i) => items[i] ?? null, [Symbol.iterator]: () => items[Symbol.iterator]() });
+const element = (nodeName, { dataset = {}, children = [] } = {}) => ({ nodeType: 1, nodeName, dataset, childNodes: nodeList(children) });
+const lineBreak = () => element('BR');
+const fieldChip = (token, label) => element('SPAN', { dataset: { token }, children: [textNode(label)] });
+const imageBlock = (src, alt, width) => element('FIGURE', {
+  dataset: { imageSrc: src, imageAlt: alt, imageWidth: String(width) },
+  children: [element('IMG'), element('DIV', { children: [element('BUTTON', { children: [textNode('Small')] }), element('INPUT')] })],
+});
+
+test('composer constants match the server renderer', () => {
+  assert.deepEqual(composer.QUICK_EMAIL_FIELDS, QUICK_EMAIL_FIELDS);
+  assert.deepEqual(composer.IMAGE_WIDTH, EMAIL_IMAGE_WIDTH);
+  for (const size of composer.IMAGE_SIZES) {
+    assert.equal(composer.clampImageWidth(size.width), size.width, size.label);
+  }
+});
+
+test('serializeEditor turns chips, line breaks, and image blocks into the message format', () => {
+  const root = element('DIV', { children: [
+    textNode('Hi '), fieldChip('{{{contact.first_name|there}}}', 'First name'), textNode('​,'), lineBreak(), lineBreak(),
+    textNode('Flyer:'), imageBlock(`/api/email-images/${IMAGE_NAME}`, 'Hack Hours flyer', 360), textNode('​See you there'),
+  ] });
+  const message = composer.serializeEditor(root);
+  assert.equal(message, `Hi {{{contact.first_name|there}}},\n\nFlyer:\n![Hack Hours flyer](/api/email-images/${IMAGE_NAME}){width=360}\nSee you there`);
+  // Round trip: the server renders the serialized message as intended.
+  const html = quickEmailBodyHtml(message);
+  assert.match(html, /<p>Hi \{\{\{contact\.first_name\|there\}\}\},<\/p>/);
+  assert.match(html, new RegExp(`<img src="/api/email-images/${IMAGE_NAME}" alt="Hack Hours flyer" width="360">`));
+  assert.match(html, /<p>See you there<\/p>/);
+});
+
+test('serializeEditor treats block elements as lines and collapses extra blank lines', () => {
+  const root = element('DIV', { children: [
+    element('DIV', { children: [textNode('Line one')] }),
+    element('DIV', { children: [lineBreak()] }),
+    element('DIV', { children: [lineBreak()] }),
+    element('DIV', { children: [textNode('- bullet')] }),
+  ] });
+  assert.equal(composer.serializeEditor(root), 'Line one\n\n- bullet');
+  assert.equal(composer.serializeEditor(element('DIV', { children: [textNode('​'), lineBreak()] })), '');
+});
+
+test('imageLine sanitizes the description and clamps the width', () => {
+  assert.equal(composer.imageLine({ src: '/a.png', alt: 'Flyer [v2]\nfinal', width: 9999 }), '![Flyer v2 final](/a.png){width=552}');
+  assert.equal(composer.imageLine({ src: '/a.png', alt: '', width: 0 }), '![Image](/a.png)');
+  assert.equal(composer.altFromFilename('hack-hours_flyer (1).webp'), 'hack hours flyer 1');
+});
+
+test('serializeEditor writes headings, links, and bold with their spacing intact', () => {
+  const link = { ...element('A', { children: [textNode(' the post')] }), getAttribute: (name) => (name === 'href' ? '/blog/x' : null) };
+  const unsafe = { ...element('A', { children: [textNode('bad')] }), getAttribute: () => 'javascript:alert(1)' };
+  const root = element('DIV', { children: [
+    element('H2', { children: [textNode('Title')] }),
+    textNode('Read'), link, textNode(' and'), element('STRONG', { children: [textNode(' this ')] }), textNode('now '), unsafe,
+  ] });
+  assert.equal(composer.serializeEditor(root), '## Title\nRead [the post](/blog/x) and **this** now bad');
+});
+
+test('htmlToMessage converts a blog post body into the editable message format', () => {
+  const a = (href, text) => ({ ...element('A', { children: [textNode(text)] }), getAttribute: (name) => (name === 'href' ? href : null) });
+  const img = (src, alt) => ({ ...element('IMG'), getAttribute: (name) => ({ src, alt })[name] ?? null });
+  const body = element('DIV', { children: [
+    element('P', { children: [textNode('\n  One of the best   parts is '), element('STRONG', { children: [textNode('Continuum')] }), textNode('.\n')] }),
+    element('FIGURE', { children: [img('/images/blog/c.png', 'Popup'), element('FIGCAPTION', { children: [textNode('One click to capture.')] })] }),
+    element('H2', { children: [textNode('Try it out')] }),
+    element('UL', { children: [
+      element('LI', { children: [a('https://chromewebstore.google.com/x', 'Chrome Web Store')] }),
+      element('LI', { children: [a('javascript:alert(1)', 'Not a link')] }),
+    ] }),
+    element('SCRIPT', { children: [textNode('alert(1)')] }),
+  ] });
+  assert.equal(composer.htmlToMessage(body), [
+    'One of the best parts is **Continuum**.',
+    '![Popup](/images/blog/c.png)',
+    'One click to capture.',
+    '## Try it out',
+    '- [Chrome Web Store](https://chromewebstore.google.com/x)\n- Not a link',
+  ].join('\n\n'));
+});
+
+test('messageBlocks and inlineParts rebuild editor content from message text', () => {
+  const blocks = composer.messageBlocks('## Hi {{{contact.first_name|there}}}\n\nRead [this](/blog/x), **now**!\n![Flyer](/a.png){width=300}');
+  assert.deepEqual(blocks, [
+    { type: 'heading', level: 2, parts: [{ type: 'text', value: 'Hi ' }, { type: 'field', label: 'First name', token: '{{{contact.first_name|there}}}' }] },
+    { type: 'blank' },
+    { type: 'line', parts: [
+      { type: 'text', value: 'Read ' }, { type: 'link', text: 'this', href: '/blog/x' }, { type: 'text', value: ', ' },
+      { type: 'bold', text: 'now' }, { type: 'text', value: '!' },
+    ] },
+    { type: 'image', alt: 'Flyer', src: '/a.png', width: 300 },
+  ]);
+  assert.deepEqual(composer.inlineParts('{{{contact.unknown}}} {{{contact.email}}}'), [
+    { type: 'text', value: '{{{contact.unknown}}} ' },
+    { type: 'field', label: 'Email', token: '{{{contact.email}}}' },
+  ]);
+});
+
+test('previewWithSampleContact fills fields like a real inbox but leaves other tokens alone', () => {
+  const html = composer.previewWithSampleContact('<p>Hi {{{contact.first_name|there}}} {{{contact.last_name}}} ({{{contact.email}}}), {{{contact.company|friend}}}</p><a href="{{{RESEND_UNSUBSCRIBE_URL}}}">x</a>');
+  assert.equal(html, '<p>Hi Alex Rivera (alex.rivera@example.com), friend</p><a href="{{{RESEND_UNSUBSCRIBE_URL}}}">x</a>');
+  assert.equal(composer.previewWithSampleContact('{{{contact.first_name}}}', { first_name: '<b>' }), '&lt;b&gt;');
 });

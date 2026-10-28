@@ -7,8 +7,7 @@ directory = "./public"
 binding = "ASSETS"
 run_worker_first = ["/api/*", "/events/*"]
 
-# Reconcile blog email-blast send-log rows against Resend's real broadcast
-# status (scheduled -> sending -> sent/canceled). Runs once daily; see worker.js `scheduled`.
+# Daily sponsorship reminder previews; see worker.js `scheduled`.
 [triggers]
 crons = ["0 15 * * *"]
 
