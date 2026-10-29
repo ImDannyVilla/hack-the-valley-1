@@ -1,7 +1,8 @@
 // Reconcile Resend's General segment with global Contacts. Read-only by default.
-// Usage: RESEND_API_KEY=... RESEND_ALL_CONTACTS_SEGMENT_ID=... node scripts/sync-general-segment.mjs [--apply]
-// --apply changes segment membership only; it never sends mail or changes subscription status.
+// Apply requires a private JSON file of verified opt-in emails; never infer
+// mailing consent from mere presence in Resend's global Contacts.
 import { pathToFileURL } from 'node:url';
+import { readFile } from 'node:fs/promises';
 
 async function list(fetcher, apiKey, path) {
   const items = [];
@@ -22,8 +23,9 @@ async function list(fetcher, apiKey, path) {
   throw new Error(`Resend ${path} exceeded the pagination limit; refusing a partial reconciliation.`);
 }
 
-export async function reconcileGeneral({ apiKey, segmentId, fetcher = fetch, apply = false }) {
+export async function reconcileGeneral({ apiKey, segmentId, fetcher = fetch, apply = false, consentEmails = null }) {
   if (!apiKey || !segmentId) throw new Error('RESEND_API_KEY and RESEND_ALL_CONTACTS_SEGMENT_ID are required.');
+  if (apply && !Array.isArray(consentEmails)) throw new Error('Apply requires a verified opt-in email list.');
   const segments = await list(fetcher, apiKey, '/segments');
   if (!segments.some((segment) => segment.id === segmentId && segment.name?.trim().toLowerCase() === 'general')) {
     throw new Error('Configured segment ID is not named General; refusing to reconcile the wrong audience.');
@@ -39,25 +41,31 @@ export async function reconcileGeneral({ apiKey, segmentId, fetcher = fetch, app
   const extra = [...current.keys()].filter((email) => !global.has(email));
   if (extra.length) throw new Error('General contains contacts outside the global contact list; inspect Resend before changing membership.');
   if (!apply) return { total: global.size, members: current.size, missing: missing.length, applied: 0, dryRun: true };
-  for (const email of missing) {
+  const approved = new Set(consentEmails.map((value) => String(value).trim().toLowerCase()));
+  if (approved.has('') || [...approved].some((email) => !global.has(email))) throw new Error('Opt-in list contains invalid or unknown Resend contacts.');
+  const eligible = missing.filter((email) => approved.has(email));
+  for (const email of eligible) {
     const response = await fetcher(`https://api.resend.com/contacts/${encodeURIComponent(email)}/segments/${encodeURIComponent(segmentId)}`, {
       method: 'POST', headers: { Authorization: `Bearer ${apiKey}` },
     });
     if (!response.ok && response.status !== 409) throw new Error(`Segment add failed with HTTP ${response.status}; rerun to reconcile remaining contacts.`);
   }
   const finalMembers = emails(await list(fetcher, apiKey, path));
-  const remaining = [...global.keys()].filter((email) => !finalMembers.has(email));
-  if (remaining.length || finalMembers.size !== global.size) throw new Error(`Readback mismatch: ${remaining.length} missing; rerun after inspecting Resend.`);
-  return { total: global.size, members: finalMembers.size, missing: 0, applied: missing.length, dryRun: false };
+  const remaining = eligible.filter((email) => !finalMembers.has(email));
+  if (remaining.length) throw new Error(`Readback mismatch: ${remaining.length} approved contacts missing; rerun after inspecting Resend.`);
+  return { total: global.size, members: finalMembers.size, missing: [...global.keys()].filter((email) => !finalMembers.has(email)).length, applied: eligible.length, dryRun: false };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const flags = process.argv.slice(2);
-  if (flags.some((flag) => flag !== '--apply')) throw new Error('Only --apply is accepted; omit it for a read-only dry run.');
+  if (flags.some((flag) => flag !== '--apply' && !flag.startsWith('--consent-file='))) throw new Error('Only --apply and --consent-file=PATH are accepted.');
+  const file = flags.find((flag) => flag.startsWith('--consent-file='))?.slice('--consent-file='.length);
+  if (flags.includes('--apply') && !file) throw new Error('Apply requires --consent-file=PATH containing a private JSON array of verified opt-in emails.');
   const result = await reconcileGeneral({
     apiKey: process.env.RESEND_API_KEY,
     segmentId: process.env.RESEND_ALL_CONTACTS_SEGMENT_ID,
     apply: flags.includes('--apply'),
+    consentEmails: file ? JSON.parse(await readFile(file, 'utf8')) : null,
   });
   console.log(JSON.stringify(result));
 }

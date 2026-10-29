@@ -6,15 +6,15 @@ Both `/api/subscribe` and opted-in event registrations now add newly created **a
 
 ## One-time existing-contact reconciliation
 
-After confirming the actual segment ID and obtaining approval to alter live segment membership, run with the existing Resend API key in a secure shell (never commit it):
+After confirming the actual segment ID, assemble a **private JSON array** of email addresses whose HTV updates opt-in is verified (outside the repo). After approval to alter live segment membership, run with the existing Resend API key in a secure shell (never commit the key or email list):
 
 ```sh
 RESEND_API_KEY=... RESEND_ALL_CONTACTS_SEGMENT_ID=... node scripts/sync-general-segment.mjs
 # Inspect counts, then only after approval:
-RESEND_API_KEY=... RESEND_ALL_CONTACTS_SEGMENT_ID=... node scripts/sync-general-segment.mjs --apply
+RESEND_API_KEY=... RESEND_ALL_CONTACTS_SEGMENT_ID=... node scripts/sync-general-segment.mjs --apply --consent-file=/secure/path/verified-opt-ins.json
 ```
 
-Dry-run prints **counts only**. Apply checks that the ID still names `General`, adds missing global Resend contacts to it without sending mail or changing unsubscribe status, then reads back exact email membership. It is safe to rerun after partial failures; do not infer consent solely from global contact existence without reviewing the source of imported contacts first. Global contacts and opted-in HTV subscribers are not necessarily identical.
+Dry-run prints **counts only**. Apply checks that the ID still names `General`, adds only approved-list contacts missing from it without sending mail or changing unsubscribe status, then reads back their exact membership. It is safe to rerun after partial failures; do not infer consent solely from global contact existence. If the readback reports remaining global contacts, the existing broadcast preflight will continue to block an "all contacts" send until their eligibility is resolved.
 
 ## Release order
 
