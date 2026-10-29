@@ -49,6 +49,7 @@ import {
   updateEventProjectSubmissionStatus as domainUpdateEventProjectSubmissionStatus,
   upsertProjectFromSubmission as domainUpsertProjectFromSubmission
 } from "./domain/submissions.js";
+import { addContactToUpdatesSegment, updatesSegmentId } from "../_shared/mailing-list.js";
 
 export {
   EventInstanceSchema,
@@ -2150,6 +2151,11 @@ export async function addSignupToEmailList(env, signup, event) {
   if (!apiKey) {
     return { status: "skipped_not_configured", detail: "RESEND_API_KEY is not configured" };
   }
+  try {
+    updatesSegmentId(env);
+  } catch (error) {
+    return { status: "failed", detail: error.message };
+  }
 
   const contactBody = {
     email: signup.email,
@@ -2182,7 +2188,12 @@ export async function addSignupToEmailList(env, signup, event) {
     }
   }
 
-  return { status: "synced", detail: `Resend contact ${contactStatus}; event signup stored in HTV_DB` };
+  try {
+    await addContactToUpdatesSegment({ email: signup.email, env });
+  } catch (error) {
+    return { status: "failed", detail: `Resend contact ${contactStatus}, but updates segment sync failed: ${error.message}`.slice(0, 500) };
+  }
+  return { status: "synced", detail: `Resend contact ${contactStatus} and updates segment synced; event signup stored in HTV_DB` };
 }
 
 async function resendFetch(env, path, init) {

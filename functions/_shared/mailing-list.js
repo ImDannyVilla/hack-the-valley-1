@@ -59,15 +59,26 @@ export function buildResendContactPayload(subscriber, env = {}, options = {}) {
   return payload;
 }
 
-async function addContactToSegment({ subscriber, env = {}, headers, fetcher }) {
-  const segmentId = String(env.RESEND_SEGMENT_ID || '').trim();
-  if (!segmentId) return;
+// Both website subscriptions and opted-in event signups use one broadcast audience.
+// A synced contact outside it is not a completed updates-list subscription.
+export function updatesSegmentId(env = {}) {
+  const segmentId = String(env.RESEND_ALL_CONTACTS_SEGMENT_ID || '').trim();
+  if (!segmentId) {
+    const error = new Error('RESEND_ALL_CONTACTS_SEGMENT_ID is not configured.');
+    error.status = 503;
+    throw error;
+  }
+  return segmentId;
+}
 
+export async function addContactToUpdatesSegment({ email, env = {}, fetcher = fetch }) {
+  const segmentId = updatesSegmentId(env);
+  const apiKey = String(env.RESEND_API_KEY || '').trim();
   const response = await fetcher(
-    `https://api.resend.com/contacts/${encodeURIComponent(subscriber.email)}/segments/${encodeURIComponent(segmentId)}`,
+    `https://api.resend.com/contacts/${encodeURIComponent(email)}/segments/${encodeURIComponent(segmentId)}`,
     {
       method: 'POST',
-      headers,
+      headers: { Authorization: `Bearer ${apiKey}` },
     }
   );
 
@@ -93,6 +104,7 @@ export async function syncContactWithResend({ subscriber, env = {}, fetcher = fe
     error.status = 503;
     throw error;
   }
+  updatesSegmentId(env);
 
   const createBody = buildResendContactPayload(subscriber, env);
   const headers = {
@@ -107,7 +119,7 @@ export async function syncContactWithResend({ subscriber, env = {}, fetcher = fe
   });
 
   if (createResponse.ok) {
-    await addContactToSegment({ subscriber, env, headers, fetcher });
+    await addContactToUpdatesSegment({ email: subscriber.email, env, fetcher });
     return { action: 'created' };
   }
 
@@ -119,7 +131,7 @@ export async function syncContactWithResend({ subscriber, env = {}, fetcher = fe
       body: JSON.stringify(updateBody),
     });
     if (updateResponse.ok) {
-      await addContactToSegment({ subscriber, env, headers, fetcher });
+      await addContactToUpdatesSegment({ email: subscriber.email, env, fetcher });
       return { action: 'updated' };
     }
     const updateError = new Error(`Resend contact update failed with HTTP ${updateResponse.status}: ${await readResponseText(updateResponse)}`);
