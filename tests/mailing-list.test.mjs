@@ -59,7 +59,7 @@ test('buildResendContactPayload sends only Resend-supported contact fields', () 
       interest: 'Mentor nights',
       source: 'homepage',
     },
-    { RESEND_SEGMENT_ID: 'seg_123' }
+    { RESEND_ALL_CONTACTS_SEGMENT_ID: 'seg_general' }
   );
 
   assert.equal(payload.email, 'builder@example.com');
@@ -84,7 +84,7 @@ test('subscribe API creates a Resend contact with the configured API key', async
   const calls = [];
   const response = await onRequestPost({
     request: jsonRequest({ email: 'builder@example.com', name: 'Ada Lovelace', source: 'homepage' }),
-    env: { RESEND_API_KEY: 're_test_key', RESEND_SEGMENT_ID: 'seg_123' },
+    env: { RESEND_API_KEY: 're_test_key', RESEND_ALL_CONTACTS_SEGMENT_ID: 'seg_general' },
     fetch: mockFetch([{ status: 200, body: { id: 'contact_123' } }], calls),
   });
 
@@ -100,7 +100,7 @@ test('subscribe API creates a Resend contact with the configured API key', async
   const body = JSON.parse(calls[0].init.body);
   assert.equal(body.email, 'builder@example.com');
   assert.equal(body.properties, undefined);
-  assert.equal(calls[1].url, 'https://api.resend.com/contacts/builder%40example.com/segments/seg_123');
+  assert.equal(calls[1].url, 'https://api.resend.com/contacts/builder%40example.com/segments/seg_general');
   assert.equal(calls[1].init.method, 'POST');
 });
 
@@ -108,7 +108,7 @@ test('subscribe API patches an existing Resend contact when create returns a dup
   const calls = [];
   const response = await onRequestPost({
     request: jsonRequest({ email: 'Builder@Example.com', name: 'Ada Lovelace' }),
-    env: { RESEND_API_KEY: 're_test_key' },
+    env: { RESEND_API_KEY: 're_test_key', RESEND_ALL_CONTACTS_SEGMENT_ID: 'seg_general' },
     fetch: mockFetch([
       { status: 409, body: { message: 'Contact already exists' } },
       { status: 200, body: { id: 'contact_123' } },
@@ -116,11 +116,32 @@ test('subscribe API patches an existing Resend contact when create returns a dup
   });
 
   assert.equal(response.status, 200);
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 3);
   assert.equal(calls[1].url, 'https://api.resend.com/contacts/builder%40example.com');
   assert.equal(calls[1].init.method, 'PATCH');
   const updateBody = JSON.parse(calls[1].init.body);
   assert.equal(Object.hasOwn(updateBody, 'unsubscribed'), false);
+  assert.equal(calls[2].url, 'https://api.resend.com/contacts/builder%40example.com/segments/seg_general');
+});
+
+test('subscribe refuses to claim success without the configured General segment', async () => {
+  const calls = [];
+  const response = await onRequestPost({
+    request: jsonRequest({ email: 'builder@example.com' }),
+    env: { RESEND_API_KEY: 're_test_key' },
+    fetch: mockFetch([], calls),
+  });
+  assert.equal(response.status, 503);
+  assert.equal(calls.length, 0);
+});
+
+test('subscribe reports a failed segment add rather than claiming list membership', async () => {
+  const response = await onRequestPost({
+    request: jsonRequest({ email: 'builder@example.com' }),
+    env: { RESEND_API_KEY: 're_test_key', RESEND_ALL_CONTACTS_SEGMENT_ID: 'seg_general' },
+    fetch: mockFetch([{ status: 200 }, { status: 503 }]),
+  });
+  assert.equal(response.status, 502);
 });
 
 test('subscribe API does not pretend success when Resend is not configured', async () => {
