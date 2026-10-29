@@ -10,7 +10,8 @@
 --   revision    optimistic concurrency: a save must name the revision it edited
 --
 -- Publishing is the human approval step for this public content; publish and
--- unpublish (and edits to a live post) are written to audit_events.
+-- unpublish (and edits to a live post) are written to audit_events in the same
+-- transaction as the change, so neither is ever stored without the other.
 CREATE TABLE blog_posts (
   id TEXT PRIMARY KEY,
   slug TEXT NOT NULL UNIQUE,
@@ -28,3 +29,13 @@ CREATE TABLE blog_posts (
 );
 
 CREATE INDEX idx_blog_posts_status_date ON blog_posts(status, post_date DESC);
+
+-- A change to a post and its audit event are one D1 batch. Batches can't
+-- branch, so each one starts with a guard row that is valid only while the
+-- post still has the revision and status the request read. If another change
+-- landed first, the CHECK fails and the whole batch (change and audit event)
+-- rolls back. Same pattern as sponsorship_write_guards (migration 0030).
+CREATE TABLE blog_post_write_guards (
+  id TEXT PRIMARY KEY,
+  valid INTEGER NOT NULL CHECK (valid = 1)
+);

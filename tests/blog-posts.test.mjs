@@ -8,7 +8,7 @@ import { readFileSync } from 'node:fs';
 import worker from '../worker.js';
 import { createSponsorshipDb, DEMO_USERS } from './helpers/sponsorship-db.mjs';
 import { sponsorHash } from '../functions/_lib/domain/sponsorships.js';
-import { pacificDate } from '../functions/_lib/domain/blog-post.js';
+import { pacificDate, publishBlogPost, saveBlogPost } from '../functions/_lib/domain/blog-post.js';
 import { MessageDraft } from '../functions/_lib/domain/message-draft.js';
 import { renderBlogPostPage, formatPostDate } from '../functions/_shared/blog-page.js';
 import { postStateLabel, slugify } from '../public/admin-blog-posts.js';
@@ -184,6 +184,97 @@ test('unpublishing takes the post down but keeps its URL reserved', async (t) =>
   assert.deepEqual(listed.body.posts.map((post) => post.slug), ['welcome']);
   assert.equal((await call(env, 'PUT', `/api/admin/blog-posts/${ID}`, { body: { ...POST, revision: 1, slug: 'renamed' } })).status, 409);
   assert.deepEqual(await auditActions(env, ID), ['blog_post.publish', 'blog_post.unpublish']);
+});
+
+// --- the audit trail is part of each change ----------------------------------
+
+// Make every blog audit write fail, to prove a change is never stored without
+// its audit event.
+const breakBlogAudits = (env) => env.HTV_DB.exec("CREATE TRIGGER fail_blog_audit BEFORE INSERT ON audit_events WHEN NEW.target_type = 'blog_post' BEGIN SELECT RAISE(ABORT, 'audit store unavailable'); END");
+const fixBlogAudits = (env) => env.HTV_DB.exec('DROP TRIGGER fail_blog_audit');
+const storedPost = async (env) => (await json(await call(env, 'GET', `/api/admin/blog-posts/${ID}`))).body.post;
+
+test('a publish whose audit write fails is not stored, so a retry publishes and audits it', async (t) => {
+  const env = await setup(t);
+  await call(env, 'PUT', `/api/admin/blog-posts/${ID}`, { body: POST });
+  await breakBlogAudits(env);
+  const failed = await json(await call(env, 'POST', `/api/admin/blog-posts/${ID}/publish`));
+  assert.equal(failed.status, 500);
+  assert.match(failed.body.error, /audit record, so nothing was changed/);
+  assert.equal((await storedPost(env)).status, 'draft');
+  assert.equal((await call(env, 'GET', '/blog/techpath-kern', { user: null })).status, 404, 'not live');
+  assert.deepEqual(await auditActions(env, ID), []);
+
+  await fixBlogAudits(env);
+  const retried = await json(await call(env, 'POST', `/api/admin/blog-posts/${ID}/publish`));
+  assert.equal(retried.body.post.status, 'published');
+  assert.deepEqual(await auditActions(env, ID), ['blog_post.publish'], 'the retry is audited');
+});
+
+test('unpublishing or editing a live post is not stored when its audit write fails', async (t) => {
+  const env = await setup(t);
+  await call(env, 'PUT', `/api/admin/blog-posts/${ID}`, { body: POST });
+  await call(env, 'POST', `/api/admin/blog-posts/${ID}/publish`);
+  await breakBlogAudits(env);
+  assert.equal((await call(env, 'PUT', `/api/admin/blog-posts/${ID}`, { body: { ...POST, revision: 1, title: 'Edited live' } })).status, 500);
+  assert.equal((await call(env, 'POST', `/api/admin/blog-posts/${ID}/unpublish`)).status, 500);
+  const post = await storedPost(env);
+  assert.deepEqual([post.status, post.title, post.revision], ['published', POST.title, 1], 'neither change was stored');
+  assert.equal((await call(env, 'GET', '/blog/techpath-kern', { user: null })).status, 200, 'still live');
+  assert.deepEqual(await auditActions(env, ID), ['blog_post.publish']);
+
+  await fixBlogAudits(env);
+  assert.equal((await call(env, 'PUT', `/api/admin/blog-posts/${ID}`, { body: { ...POST, revision: 1, title: 'Edited live' } })).status, 200);
+  assert.equal((await json(await call(env, 'POST', `/api/admin/blog-posts/${ID}/unpublish`))).body.post.status, 'draft');
+  assert.deepEqual(await auditActions(env, ID), ['blog_post.publish', 'blog_post.update', 'blog_post.unpublish']);
+});
+
+test('saving a draft does not depend on the audit log', async (t) => {
+  const env = await setup(t);
+  await call(env, 'PUT', `/api/admin/blog-posts/${ID}`, { body: POST });
+  await breakBlogAudits(env);
+  const saved = await json(await call(env, 'PUT', `/api/admin/blog-posts/${ID}`, { body: { ...POST, revision: 1, title: 'Draft edit' } }));
+  assert.equal(saved.status, 200, 'drafts are not public, so their edits are not audited');
+  assert.equal(saved.body.post.revision, 2);
+});
+
+// A database whose next batch first runs `competing`, as if another admin's
+// change landed after this request read the post and before it wrote.
+function racingDb(db, competing) {
+  let raced = false;
+  return {
+    prepare: db.prepare.bind(db),
+    async batch(statements) {
+      if (!raced) {
+        raced = true;
+        await competing();
+      }
+      return db.batch(statements);
+    },
+  };
+}
+
+test('a publish that races another publish is stored and audited once', async (t) => {
+  const env = await setup(t);
+  await call(env, 'PUT', `/api/admin/blog-posts/${ID}`, { body: POST });
+  const db = racingDb(env.HTV_DB, () => publishBlogPost(env.HTV_DB, ID, { actorUserId: DEMO_USERS.danny }));
+  const post = await publishBlogPost(db, ID, { actorUserId: DEMO_USERS.alex });
+  assert.equal(post.status, 'published');
+  const { results } = await env.HTV_DB.prepare('SELECT action, actor_user_id FROM audit_events WHERE target_id = ?').bind(ID).all();
+  assert.deepEqual(results.map((row) => [row.action, row.actor_user_id]), [['blog_post.publish', DEMO_USERS.danny]]);
+});
+
+test('an edit that races another edit is refused and leaves no audit event', async (t) => {
+  const env = await setup(t);
+  await call(env, 'PUT', `/api/admin/blog-posts/${ID}`, { body: POST });
+  await call(env, 'POST', `/api/admin/blog-posts/${ID}/publish`);
+  const db = racingDb(env.HTV_DB, () => env.HTV_DB.prepare('UPDATE blog_posts SET title = ?, revision = revision + 1 WHERE id = ?').bind('Their edit', ID).run());
+  await assert.rejects(
+    saveBlogPost(db, ID, { ...POST, revision: 1, title: 'My edit' }, { actorUserId: DEMO_USERS.alex, assets: ASSETS, origin: 'https://hackthevalley.org' }),
+    (error) => error.status === 409,
+  );
+  assert.equal((await storedPost(env)).title, 'Their edit');
+  assert.deepEqual(await auditActions(env, ID), ['blog_post.publish']);
 });
 
 test('the admin list shows admin posts for editing and file posts read-only', async (t) => {

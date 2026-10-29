@@ -10,11 +10,12 @@
 // Callers load a BlogPost and ask it for its body / web URL, list published
 // posts, and save, publish, or unpublish admin posts through the functions
 // below. Publishing is the human approval step for this public content, so
-// publish, unpublish, and edits to a live post are audited.
+// publish, unpublish, and edits to a live post are audited, in the same
+// transaction as the change.
 
 import { renderBlogPostPage } from '../../_shared/blog-page.js';
 import { messageBodyHtml } from '../../_shared/message-format.js';
-import { appendAuditEvent, buildAuditEvent } from './audit.js';
+import { auditEventStatement, buildAuditEvent } from './audit.js';
 
 // Implementation detail: where a file-based post's body starts/ends. PRIVATE
 // on purpose — nothing outside this module should know posts use markers.
@@ -255,16 +256,52 @@ function isUniqueSlugError(error) {
   return /UNIQUE constraint failed: blog_posts\.slug/i.test(String(error?.message || ''));
 }
 
-async function audit(db, action, row, actorUserId) {
-  await appendAuditEvent(db, buildAuditEvent({
+function slugTaken(slug) {
+  return httpError(`Another post already uses /blog/${slug}. Choose another URL.`, 409);
+}
+
+// The audit event for a change to a live post, or to whether it is live.
+function auditEvent(action, post, actorUserId, at) {
+  return buildAuditEvent({
     action,
     actorUserId,
     targetType: 'blog_post',
-    targetId: row.id,
+    targetId: post.id,
     scopeType: 'global',
     scopeId: '*',
-    metadata: { slug: row.slug, title: row.title },
-  }));
+    metadata: { slug: post.slug, title: post.title },
+    createdAt: at,
+  });
+}
+
+// Store a change to a post together with its audit event (if any) as one D1
+// batch, which is a transaction: both are stored or neither is. The batch is
+// guarded by the revision and status read in `row` (blog_post_write_guards,
+// migration 0032), so if another change landed in between, nothing is written
+// and this returns false. Any other failure throws, also having written nothing.
+async function commitChange(db, row, change, audit = null) {
+  const guardId = `guard_${crypto.randomUUID().replaceAll('-', '')}`;
+  const statements = [
+    db
+      .prepare(
+        `INSERT INTO blog_post_write_guards (id, valid)
+         VALUES (?, (SELECT COUNT(*) FROM blog_posts WHERE id = ? AND revision = ? AND status = ?))`
+      )
+      .bind(guardId, row.id, row.revision, row.status),
+    change,
+    ...(audit ? [auditEventStatement(db, audit)] : []),
+    db.prepare('DELETE FROM blog_post_write_guards WHERE id = ?').bind(guardId),
+  ];
+  try {
+    await db.batch(statements);
+    return true;
+  } catch (error) {
+    const current = await findRow(db, row.id);
+    if (!current || Number(current.revision) !== Number(row.revision) || current.status !== row.status) return false;
+    if (isUniqueSlugError(error)) throw error;
+    const what = audit ? 'this change and its audit record' : 'this change';
+    throw httpError(`Couldn't store ${what}, so nothing was changed. Try again.`, 500, { cause: error });
+  }
 }
 
 // The date shown on a post: today in Bakersfield, not UTC.
@@ -288,7 +325,7 @@ export async function listBlogPostRecords(db) {
 //     retry after a timeout);
 //   - saving over someone else's newer edit is refused (409);
 //   - a published post's URL is locked, because links to it would break.
-// Editing a published post updates the live page and is audited.
+// Editing a published post updates the live page and is audited with it.
 export async function saveBlogPost(db, id, input = {}, { actorUserId = null, assets, origin, now = new Date() } = {}) {
   const postKey = postId(id);
   const fields = validateBlogPostInput(input);
@@ -309,9 +346,9 @@ export async function saveBlogPost(db, id, input = {}, { actorUserId = null, ass
     return toBlogPostRecord(existing);
   }
 
-  try {
-    if (!existing) {
-      if (revision !== 0) throw httpError('This post no longer exists. Copy your text, then start a new post.', 409);
+  if (!existing) {
+    if (revision !== 0) throw httpError('This post no longer exists. Copy your text, then start a new post.', 409);
+    try {
       await db
         .prepare(
           `INSERT INTO blog_posts (id, slug, title, summary, body, status, revision, created_by_user_id, updated_by_user_id, created_at, updated_at)
@@ -319,33 +356,33 @@ export async function saveBlogPost(db, id, input = {}, { actorUserId = null, ass
         )
         .bind(postKey, fields.slug, fields.title, fields.summary, fields.body, actorUserId, actorUserId, stamp, stamp)
         .run();
-      return toBlogPostRecord(await requireRow(db, postKey));
+    } catch (error) {
+      throw isUniqueSlugError(error) ? slugTaken(fields.slug) : error;
     }
-
-    if (Number(existing.revision) !== revision) {
-      throw httpError('This post was changed somewhere else. Reload it before saving.', 409);
-    }
-    if (existing.published_at && fields.slug !== existing.slug) {
-      throw httpError("The URL can't change after a post has been published, because links to it would break.", 409);
-    }
-    const result = await db
-      .prepare(
-        `UPDATE blog_posts SET slug = ?, title = ?, summary = ?, body = ?, revision = revision + 1, updated_by_user_id = ?, updated_at = ?
-         WHERE id = ? AND revision = ?`
-      )
-      .bind(fields.slug, fields.title, fields.summary, fields.body, actorUserId, stamp, postKey, revision)
-      .run();
-    if (Number(result?.meta?.changes ?? 1) !== 1) {
-      throw httpError('This post was changed somewhere else. Reload it before saving.', 409);
-    }
-  } catch (error) {
-    if (isUniqueSlugError(error)) throw httpError(`Another post already uses /blog/${fields.slug}. Choose another URL.`, 409);
-    throw error;
+    return toBlogPostRecord(await requireRow(db, postKey));
   }
 
-  const saved = await requireRow(db, postKey);
-  if (saved.status === 'published') await audit(db, 'blog_post.update', saved, actorUserId);
-  return toBlogPostRecord(saved);
+  if (Number(existing.revision) !== revision) {
+    throw httpError('This post was changed somewhere else. Reload it before saving.', 409);
+  }
+  if (existing.published_at && fields.slug !== existing.slug) {
+    throw httpError("The URL can't change after a post has been published, because links to it would break.", 409);
+  }
+  const update = db
+    .prepare(
+      `UPDATE blog_posts SET slug = ?, title = ?, summary = ?, body = ?, revision = revision + 1, updated_by_user_id = ?, updated_at = ?
+       WHERE id = ? AND revision = ?`
+    )
+    .bind(fields.slug, fields.title, fields.summary, fields.body, actorUserId, stamp, postKey, revision);
+  const audit = existing.status === 'published' ? auditEvent('blog_post.update', { id: postKey, ...fields }, actorUserId, stamp) : null;
+  let committed;
+  try {
+    committed = await commitChange(db, existing, update, audit);
+  } catch (error) {
+    throw isUniqueSlugError(error) ? slugTaken(fields.slug) : error;
+  }
+  if (!committed) throw httpError('This post was changed somewhere else. Reload it before saving.', 409);
+  return toBlogPostRecord(await requireRow(db, postKey));
 }
 
 // Make a post public at /blog/<slug>. Publishing again is a no-op; the post
@@ -353,16 +390,21 @@ export async function saveBlogPost(db, id, input = {}, { actorUserId = null, ass
 export async function publishBlogPost(db, id, { actorUserId = null, now = new Date() } = {}) {
   const row = await requireRow(db, postId(id));
   if (row.status === 'published') return toBlogPostRecord(row);
-  const result = await db
+  const stamp = now.toISOString();
+  const publish = db
     .prepare(
       `UPDATE blog_posts SET status = 'published', post_date = ?, published_at = ?, updated_by_user_id = ?, updated_at = ?
        WHERE id = ? AND status = 'draft'`
     )
-    .bind(row.post_date || pacificDate(now), row.published_at || now.toISOString(), actorUserId, now.toISOString(), row.id)
-    .run();
-  const published = await requireRow(db, row.id);
-  if (Number(result?.meta?.changes ?? 1) === 1) await audit(db, 'blog_post.publish', published, actorUserId);
-  return toBlogPostRecord(published);
+    .bind(row.post_date || pacificDate(now), row.published_at || stamp, actorUserId, stamp, row.id);
+  if (!(await commitChange(db, row, publish, auditEvent('blog_post.publish', row, actorUserId, stamp)))) {
+    // Something else changed it first. A post that is now published is the
+    // same outcome (publishing again is a no-op); anything else needs a reload.
+    const current = await requireRow(db, row.id);
+    if (current.status === 'published') return toBlogPostRecord(current);
+    throw httpError('This post was changed somewhere else. Reload it, then publish.', 409);
+  }
+  return toBlogPostRecord(await requireRow(db, row.id));
 }
 
 // Take a post off the blog (it becomes a draft again). Unpublishing a draft is
@@ -370,14 +412,17 @@ export async function publishBlogPost(db, id, { actorUserId = null, now = new Da
 export async function unpublishBlogPost(db, id, { actorUserId = null, now = new Date() } = {}) {
   const row = await requireRow(db, postId(id));
   if (row.status !== 'published') return toBlogPostRecord(row);
-  const result = await db
+  const stamp = now.toISOString();
+  const unpublish = db
     .prepare(
       `UPDATE blog_posts SET status = 'draft', updated_by_user_id = ?, updated_at = ?
        WHERE id = ? AND status = 'published'`
     )
-    .bind(actorUserId, now.toISOString(), row.id)
-    .run();
-  const unpublished = await requireRow(db, row.id);
-  if (Number(result?.meta?.changes ?? 1) === 1) await audit(db, 'blog_post.unpublish', unpublished, actorUserId);
-  return toBlogPostRecord(unpublished);
+    .bind(actorUserId, stamp, row.id);
+  if (!(await commitChange(db, row, unpublish, auditEvent('blog_post.unpublish', row, actorUserId, stamp)))) {
+    const current = await requireRow(db, row.id);
+    if (current.status !== 'published') return toBlogPostRecord(current);
+    throw httpError('This post was changed somewhere else. Reload it, then unpublish.', 409);
+  }
+  return toBlogPostRecord(await requireRow(db, row.id));
 }
