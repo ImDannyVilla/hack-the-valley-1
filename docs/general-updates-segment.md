@@ -14,7 +14,7 @@ RESEND_API_KEY=... RESEND_ALL_CONTACTS_SEGMENT_ID=... node scripts/sync-general-
 RESEND_API_KEY=... RESEND_ALL_CONTACTS_SEGMENT_ID=... node scripts/sync-general-segment.mjs --apply --consent-file=/secure/path/verified-opt-ins.json
 ```
 
-Dry-run prints **counts only**. Apply checks that the ID still names `General`, adds only approved-list contacts missing from it without sending mail or changing unsubscribe status, then reads back their exact membership. It is safe to rerun after partial failures; do not infer consent solely from global contact existence. If the readback reports remaining global contacts, the existing broadcast preflight will continue to block an "all contacts" send until their eligibility is resolved.
+Dry-run prints **counts only**. Apply checks that the ID still names `General`, adds only approved-list contacts missing from it without sending mail or changing unsubscribe status, then reads back their exact membership. It is safe to rerun after partial failures; do not infer consent solely from global contact existence. If the readback reports remaining global contacts, they stay outside General, and so outside admin email drafts, until their eligibility is resolved. HTV admin never sends: drafts are reviewed and sent in Resend.
 
 ## Release order
 
@@ -22,4 +22,4 @@ Dry-run prints **counts only**. Apply checks that the ID still names `General`, 
 2. Verify `wrangler.toml` sets the Worker `RESEND_ALL_CONTACTS_SEGMENT_ID` variable to General's actual ID **before** deploying this code, so website subscriptions do not fail closed.
 3. Deploy only after the HTV merge/deploy approval. Verify a new opted-in signup reaches General without sending a broadcast. Do not create production junk contact data for smoke tests; use an existing approved test address if available.
 4. Apply the approved one-time reconciliation and read back membership. Resend itself still filters unsubscribed/suppressed contacts on send.
-5. Before any later send, verify the intended recipient set and require explicit human approval. PR #119's draft path auto-discovers `General` as a *placeholder*; once General holds everyone, it is **not** a harmless placeholder. Coordinate its draft-target copy/config before that PR merges.
+5. Before any later send, verify the intended recipient set and require explicit human approval. Admin email drafts (`/admin` → Email) are addressed to this ID only, with no placeholder or name-based fallback. The composer shows the segment's name and live contact count under "Goes to" before a draft is created (`GET /api/admin/message-drafts/audience`), and the send itself happens in Resend after review.
