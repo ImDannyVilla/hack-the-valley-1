@@ -13,6 +13,8 @@ crons = ["0 15 * * *"]
 
 [vars]
 MAX_UPLOAD_MB = "100"
+# Resend General: HTV updates audience (segment IDs are not credentials).
+RESEND_ALL_CONTACTS_SEGMENT_ID = "e2bd5d32-9a8f-4c41-add8-fa01f98d0323"
 
 [[d1_databases]]
 binding = "HTV_DB"

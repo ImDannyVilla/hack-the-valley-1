@@ -679,13 +679,14 @@ test("Resend sync creates/updates a contact; per-event signup state stays in the
   };
   try {
     const result = await addSignupToEmailList(
-      { RESEND_API_KEY: "re_test" },
+      { RESEND_API_KEY: "re_test", RESEND_ALL_CONTACTS_SEGMENT_ID: "seg_general" },
       { email: "ada@example.com", first_name: "Ada", last_name: "Lovelace", email_list_opt_in: 1 },
       { slug: "hack-hours-panera", title: "Hack Hours at Panera" }
     );
     assert.equal(result.status, "synced");
-    assert.equal(calls.length, 1);
+    assert.equal(calls.length, 2);
     assert.equal(calls[0].url, "https://api.resend.com/contacts");
+    assert.equal(calls[1].url, "https://api.resend.com/contacts/ada%40example.com/segments/seg_general");
     const body = JSON.parse(calls[0].init.body);
     assert.equal(body.email, "ada@example.com");
     assert.equal(body.properties, undefined);
@@ -705,15 +706,38 @@ test("Resend sync patches existing contacts without forcing resubscribe", async 
   };
   try {
     const result = await addSignupToEmailList(
-      { RESEND_API_KEY: "re_test" },
+      { RESEND_API_KEY: "re_test", RESEND_ALL_CONTACTS_SEGMENT_ID: "seg_general" },
       { email: "ada@example.com", first_name: "Ada", last_name: "Lovelace", email_list_opt_in: 1 },
       { slug: "hack-hours-panera", title: "Hack Hours at Panera" }
     );
     assert.equal(result.status, "synced");
-    assert.equal(calls.length, 2);
+    assert.equal(calls.length, 3);
     assert.equal(calls[1].url, "https://api.resend.com/contacts/ada%40example.com");
+    assert.equal(calls[2].url, "https://api.resend.com/contacts/ada%40example.com/segments/seg_general");
     assert.equal(calls[1].init.method, "PATCH");
     assert.equal(Object.hasOwn(JSON.parse(calls[1].init.body), "unsubscribed"), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("event signup records a failed list sync when General is unconfigured or its add fails", async () => {
+  const signup = { email: "ada@example.com", email_list_opt_in: 1 };
+  const event = { slug: "hack-hours" };
+  const missing = await addSignupToEmailList({ RESEND_API_KEY: "re_test" }, signup, event);
+  assert.equal(missing.status, "failed");
+  assert.match(missing.detail, /RESEND_ALL_CONTACTS_SEGMENT_ID/);
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    calls.push(String(url));
+    return new Response('', { status: calls.length === 1 ? 201 : 503 });
+  };
+  try {
+    const result = await addSignupToEmailList({ RESEND_API_KEY: "re_test", RESEND_ALL_CONTACTS_SEGMENT_ID: "seg_general" }, signup, event);
+    assert.equal(result.status, "failed");
+    assert.match(result.detail, /segment sync failed/);
+    assert.equal(calls.length, 2);
   } finally {
     globalThis.fetch = originalFetch;
   }
