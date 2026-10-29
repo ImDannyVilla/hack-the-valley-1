@@ -16,6 +16,7 @@ import * as messageEditor from '../public/admin-message-editor.js';
 import * as messageDraftComposer from '../public/admin-message-draft.js';
 import { onRequestPost, onRequest } from '../functions/api/admin/message-drafts/index.js';
 import { onRequestGet as getAudience } from '../functions/api/admin/message-drafts/audience.js';
+import { BlogPost } from '../functions/_lib/domain/blog-post.js';
 import { createSponsorshipDb, DEMO_USERS } from './helpers/sponsorship-db.mjs';
 import { createFakeResend } from './helpers/fake-resend.mjs';
 import { onRequestPost as uploadImage } from '../functions/api/admin/message-drafts/images.js';
@@ -657,6 +658,29 @@ test('only a definite rejection releases the key; a 5xx stays pending until Rese
   assert.equal(createCalls(resend), 3);
   assert.equal(resend.broadcasts.length, 1);
   assert.equal((await storedReceipt(db)).broadcast_id, resend.broadcasts[0].id);
+});
+
+test("a long post title or subject is shortened to fit Resend's 70-character name limit, keeping the reference", async (t) => {
+  const db = await receiptsDb(t);
+  const resend = createFakeResend();
+  const post = new BlogPost({ slug: 'community-update', title: "Community Update: TechPath Kern, What's Next, and Hack Hours" });
+  const create = () => createResendDraft(db, new MessageDraft({ subject: 's', message: 'm', post }), {
+    actorUserId: ACTOR, key: DRAFT_KEY, segmentId: AUDIENCE, env: RESEND_ENV, fetcher: resend.fetch,
+  });
+
+  resend.nextCreate = 'lose';
+  await assert.rejects(create(), (error) => error.status === 502 && /didn't confirm the draft/.test(error.message));
+  const [made] = resend.broadcasts;
+  assert.match(made.name, /^Blog: Community Update: TechPath Kern, What's Next… · ref [a-f0-9]{12}$/);
+  assert.equal(made.name.length, 70);
+  const retry = await create();
+  assert.equal(retry.replayed, true, 'the shortened name still carries the reference, so the lost create is found');
+  assert.equal(retry.broadcastId, made.id);
+
+  const emoji = await createResendDraft(db, new MessageDraft({ subject: `${'a'.repeat(42)}🎉🎉 and more`, message: 'm' }), {
+    actorUserId: ACTOR, key: 'draft-key-0002', segmentId: AUDIENCE, env: RESEND_ENV, fetcher: resend.fetch,
+  });
+  assert.ok(emoji.name.length <= 70 && emoji.name.isWellFormed(), `an emoji at the cut is not split: ${emoji.name}`);
 });
 
 // --- admin UI --------------------------------------------------------------

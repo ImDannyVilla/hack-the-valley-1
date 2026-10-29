@@ -20,6 +20,10 @@ export const DRAFT_STATUS = 'draft';
 // (Resend may still create the draft), so it is never treated as a refusal.
 export const CREATE_TIMEOUT_MS = 15000;
 
+// The longest broadcast name Resend accepts. A longer one is refused with
+// 422 "Field `name` has a maximum of 70 items"; Resend's docs don't list it.
+export const BROADCAST_NAME_MAX = 70;
+
 function httpError(message, status, extra) {
   return Object.assign(new Error(message), { status }, extra || {});
 }

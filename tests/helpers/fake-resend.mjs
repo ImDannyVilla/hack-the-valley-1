@@ -1,7 +1,8 @@
 // A stateful stand-in for the parts of Resend's API that admin email drafts
-// use: one segment and its contacts, and broadcasts. Pass `resend.fetch` as the
-// fetcher; every request is recorded in `resend.calls`. Set `resend.nextCreate`
-// to make the next POST /broadcasts misbehave:
+// use: one segment and its contacts, and broadcasts. Like Resend, it refuses a
+// broadcast name over 70 characters. Pass `resend.fetch` as the fetcher; every
+// request is recorded in `resend.calls`. Set `resend.nextCreate` to make the
+// next POST /broadcasts misbehave:
 //   'lose'    create the broadcast, then fail as if the response was lost
 //   'down'    answer 503 without creating anything
 //   'reject'  answer 422 without creating anything
@@ -23,6 +24,9 @@ export function createFakeResend({ segment = { id: 'seg_general', name: 'General
         if (mode === 'reject') return Response.json({ name: 'validation_error', message: 'Invalid `from` field.' }, { status: 422 });
         if (mode === 'down') return Response.json({ name: 'internal_server_error', message: 'Unavailable' }, { status: 503 });
         const body = JSON.parse(init.body);
+        if (String(body.name || '').length > 70) {
+          return Response.json({ statusCode: 422, message: 'Field `name` has a maximum of 70 items.', name: 'validation_error' }, { status: 422 });
+        }
         const broadcast = { id: `bc_${resend.broadcasts.length + 1}`, name: body.name, segment_id: body.segment_id, status: 'draft', created_at: new Date().toISOString() };
         resend.broadcasts.unshift(broadcast);
         if (mode === 'lose') throw new TypeError('Network connection lost.');

@@ -13,7 +13,7 @@
 
 import { absolutizeUrls, buildEmailHtml } from '../../_shared/email-template.js';
 import { MESSAGE_LIMITS, messageBodyHtml } from '../../_shared/message-format.js';
-import { DRAFT_STATUS, createBroadcast, findBroadcast, resolveBroadcastConfig } from '../../_shared/resend-broadcasts.js';
+import { BROADCAST_NAME_MAX, DRAFT_STATUS, createBroadcast, findBroadcast, resolveBroadcastConfig } from '../../_shared/resend-broadcasts.js';
 import { loadBlogPost } from './blog-post.js';
 
 function draftError(message, status = 400) {
@@ -126,7 +126,7 @@ export async function createResendDraft(db, draft, { actorUserId, key, segmentId
       : 'Load the email audience first, so you can check who the draft goes to.', 409);
   }
 
-  const name = `${draft.broadcastName()} · ${receipt.ref}`;
+  const name = nameWithRef(draft.broadcastName(), receipt.ref);
   const html = draft.toEmailHtml({ baseUrl });
   const reservedAt = now.toISOString();
   try {
@@ -203,6 +203,18 @@ async function settledDraft(db, receipt, { config, fetcher, now }) {
   }
   await releaseReceipt(db, receipt, row.created_at);
   return null;
+}
+
+// The broadcast name: the draft's label, shortened if the whole name would
+// pass Resend's limit, then the reference. The reference is kept whole because
+// it is how an unconfirmed create is found again.
+function nameWithRef(label, ref) {
+  const suffix = ` · ${ref}`;
+  const room = BROADCAST_NAME_MAX - suffix.length;
+  if (label.length <= room) return `${label}${suffix}`;
+  const chars = Array.from(label);
+  while (chars.join('').length > room - 1) chars.pop();
+  return `${chars.join('').trimEnd()}…${suffix}`;
 }
 
 function recordCreated(db, receipt, result, at) {
