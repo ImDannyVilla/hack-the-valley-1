@@ -14,26 +14,26 @@
     };
   </script>
   <style>
-    /* Quick email editor (public/admin-quick-email.js): field chips match the Insert buttons. */
-    .qe-editor { position: relative; min-height: 16rem; max-height: 36rem; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere; outline: none; }
-    .qe-editor:focus { border-color: #06b6d4; }
-    .qe-editor[data-empty="true"]::before { content: attr(data-placeholder); position: absolute; inset: 0.75rem 1rem auto; color: #64748b; pointer-events: none; white-space: pre-line; }
-    .qe-editor.qe-drop-target { border-color: #06b6d4; background: rgba(6, 182, 212, 0.08); }
-    .qe-editor h2 { margin: 0.5rem 0; font-size: 1.25rem; font-weight: 800; }
-    .qe-editor h3 { margin: 0.5rem 0; font-size: 1.05rem; font-weight: 800; }
-    .qe-editor a { color: #22d3ee; text-decoration: underline; }
-    .qe-editor strong, .qe-editor b { color: #fff; font-weight: 800; }
-    .qe-chip { display: inline-block; margin: 0 2px; padding: 0 10px; border: 1px solid rgba(6, 182, 212, 0.6); border-radius: 9999px; background: rgba(6, 182, 212, 0.15); color: #67e8f9; font-size: 0.75rem; font-weight: 700; line-height: 1.5rem; white-space: nowrap; user-select: none; }
-    button.qe-chip { cursor: grab; }
-    button.qe-chip:hover { border-color: #06b6d4; background: rgba(6, 182, 212, 0.25); }
-    .qe-image { margin: 0.75rem 0; padding: 0.5rem; border: 1px dashed #475569; border-radius: 0.75rem; white-space: normal; }
-    .qe-image img { display: block; max-width: 100%; height: auto; margin: 0 auto; border-radius: 0.5rem; }
-    .qe-image-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; margin-top: 0.5rem; font-size: 0.75rem; color: #cbd5e1; }
-    .qe-image-tools button { padding: 0.125rem 0.625rem; border: 1px solid #475569; border-radius: 9999px; font-weight: 700; }
-    .qe-image-tools button[aria-pressed="true"] { border-color: #06b6d4; background: rgba(6, 182, 212, 0.15); color: #67e8f9; }
-    .qe-image-tools button[data-image-remove] { margin-left: auto; border-color: rgba(248, 113, 113, 0.5); color: #fca5a5; }
-    .qe-image-tools input[type="range"] { width: 7rem; accent-color: #06b6d4; }
-    .qe-image-tools input[type="text"] { flex: 1 1 8rem; min-width: 6rem; padding: 0.25rem 0.5rem; border: 1px solid #475569; border-radius: 0.375rem; background: #0f172a; color: #fff; }
+    /* Message draft editor (public/admin-message-draft.js): field chips match the Insert buttons. */
+    .msg-editor { position: relative; min-height: 16rem; max-height: 36rem; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere; outline: none; }
+    .msg-editor:focus { border-color: #06b6d4; }
+    .msg-editor[data-empty="true"]::before { content: attr(data-placeholder); position: absolute; inset: 0.75rem 1rem auto; color: #64748b; pointer-events: none; white-space: pre-line; }
+    .msg-editor.msg-drop-target { border-color: #06b6d4; background: rgba(6, 182, 212, 0.08); }
+    .msg-editor h2 { margin: 0.5rem 0; font-size: 1.25rem; font-weight: 800; }
+    .msg-editor h3 { margin: 0.5rem 0; font-size: 1.05rem; font-weight: 800; }
+    .msg-editor a { color: #22d3ee; text-decoration: underline; }
+    .msg-editor strong, .msg-editor b { color: #fff; font-weight: 800; }
+    .msg-chip { display: inline-block; margin: 0 2px; padding: 0 10px; border: 1px solid rgba(6, 182, 212, 0.6); border-radius: 9999px; background: rgba(6, 182, 212, 0.15); color: #67e8f9; font-size: 0.75rem; font-weight: 700; line-height: 1.5rem; white-space: nowrap; user-select: none; }
+    button.msg-chip { cursor: grab; }
+    button.msg-chip:hover { border-color: #06b6d4; background: rgba(6, 182, 212, 0.25); }
+    .msg-image { margin: 0.75rem 0; padding: 0.5rem; border: 1px dashed #475569; border-radius: 0.75rem; white-space: normal; }
+    .msg-image img { display: block; max-width: 100%; height: auto; margin: 0 auto; border-radius: 0.5rem; }
+    .msg-image-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; margin-top: 0.5rem; font-size: 0.75rem; color: #cbd5e1; }
+    .msg-image-tools button { padding: 0.125rem 0.625rem; border: 1px solid #475569; border-radius: 9999px; font-weight: 700; }
+    .msg-image-tools button[aria-pressed="true"] { border-color: #06b6d4; background: rgba(6, 182, 212, 0.15); color: #67e8f9; }
+    .msg-image-tools button[data-image-remove] { margin-left: auto; border-color: rgba(248, 113, 113, 0.5); color: #fca5a5; }
+    .msg-image-tools input[type="range"] { width: 7rem; accent-color: #06b6d4; }
+    .msg-image-tools input[type="text"] { flex: 1 1 8rem; min-width: 6rem; padding: 0.25rem 0.5rem; border: 1px solid #475569; border-radius: 0.375rem; background: #0f172a; color: #fff; }
   </style>
 </head>
 <body class="bg-bc-dark text-slate-100 font-sans min-h-screen">
@@ -64,14 +64,15 @@
       </div>
 
       <nav id="admin-section-nav" aria-label="Admin sections" class="sticky top-3 z-20 mb-8 rounded-3xl border border-slate-700 bg-slate-950/90 p-3 shadow-2xl shadow-slate-950/30 backdrop-blur">
-        <div class="grid sm:grid-cols-2 lg:grid-cols-8 gap-2 text-sm font-black">
+        <div class="grid sm:grid-cols-2 lg:grid-cols-5 gap-2 text-sm font-black">
           <button type="button" data-admin-nav="dashboard" title="Workflow map and links to submissions review and the project workspace." class="rounded-2xl border border-slate-700 px-4 py-3 text-left text-slate-300 hover:border-bc-cyan">Dashboard</button>
           <button type="button" data-admin-nav="live-ops" title="Run the room: cockpit, roster, check-in, emergency contacts, event photos, and follow-up packet." class="rounded-2xl border border-slate-700 px-4 py-3 text-left text-slate-300 hover:border-bc-cyan">Live ops</button>
           <button type="button" data-admin-nav="events" title="Create/update events, page copy, signup config, images, instances, and exports." class="rounded-2xl border border-slate-700 px-4 py-3 text-left text-slate-300 hover:border-bc-cyan">Events</button>
           <a href="/admin/planning/" title="Event planning: occurrences, templates, and plan timelines (separate page)." class="rounded-2xl border border-bc-cyan/60 px-4 py-3 text-left text-bc-cyan hover:border-bc-cyan">Planning</a>
           <button type="button" data-admin-nav="people" title="Users, registrations, event signups, helper interest, volunteers, mentors, judges, and sponsors." class="rounded-2xl border border-slate-700 px-4 py-3 text-left text-slate-300 hover:border-bc-cyan">People</button>
           <button type="button" data-admin-nav="resources" title="Physical inventory: equipment, supplies, checkouts, returns, photos, and assignment history." class="rounded-2xl border border-slate-700 px-4 py-3 text-left text-slate-300 hover:border-bc-cyan">Resources</button>
-          <button type="button" data-admin-nav="blog" title="Write an email or start from a blog post, preview it, and create a Resend draft." class="rounded-2xl border border-slate-700 px-4 py-3 text-left text-slate-300 hover:border-bc-cyan">Email</button>
+          <button type="button" data-admin-nav="email" title="Write an email or start from a blog post, preview it, and create a Resend draft." class="rounded-2xl border border-slate-700 px-4 py-3 text-left text-slate-300 hover:border-bc-cyan">Email</button>
+          <button type="button" data-admin-nav="blog" title="Write, preview, and publish posts on hackthevalley.org/blog." class="rounded-2xl border border-slate-700 px-4 py-3 text-left text-slate-300 hover:border-bc-cyan">Blog</button>
           <a href="/admin-sponsorships" title="Sponsorships: outreach, contacts, commitments, payments, and overdue follow-ups (separate page)." class="rounded-2xl border border-slate-700 px-4 py-3 text-left text-slate-300 hover:border-bc-cyan">Sponsorships</a>
           <button id="access-admin-nav" title="Grant or revoke global admin access. Isolated from normal event operations on purpose." type="button" data-admin-nav="access" class="hidden rounded-2xl border border-violet-500/50 px-4 py-3 text-left text-violet-200 hover:border-violet-300">Access</button>
         </div>
@@ -340,7 +341,7 @@
         <div id="admin-role-list" class="overflow-x-auto text-sm text-slate-300"></div>
       </section>
 
-      <section id="quick-email" data-admin-section="blog" class="hidden bg-bc-navy border border-slate-700 rounded-2xl p-6 mt-8">
+      <section id="message-draft" data-admin-section="email" class="hidden bg-bc-navy border border-slate-700 rounded-2xl p-6 mt-8">
         <div class="mb-4">
           <h2 class="text-2xl font-black">Email draft</h2>
           <p class="text-sm text-slate-400 mt-1">Write an announcement or start from a blog post, preview it, then create a Resend draft. Sending happens in Resend, not here.</p>
@@ -349,28 +350,28 @@
           <div class="space-y-4">
             <div>
               <label class="block"><span class="text-sm font-semibold">Start from</span>
-                <select id="quick-email-start" class="mt-1 w-full rounded-lg bg-bc-dark border border-slate-600 px-4 py-3 text-white">
+                <select id="message-draft-start" class="mt-1 w-full rounded-lg bg-bc-dark border border-slate-600 px-4 py-3 text-white">
                   <option value="">Blank message</option>
                 </select>
               </label>
-              <p id="quick-email-post-note" class="mt-1 hidden text-xs text-slate-400"></p>
+              <p id="message-draft-post-note" class="mt-1 hidden text-xs text-slate-400"></p>
             </div>
             <label class="block"><span class="text-sm font-semibold">Subject line</span>
-              <input id="quick-email-subject" maxlength="150" placeholder="Hack Hours is back: Sat, Nov 7 at Panera" class="mt-1 w-full rounded-lg bg-bc-dark border border-slate-600 px-4 py-3 text-white">
+              <input id="message-draft-subject" maxlength="150" placeholder="Hack Hours is back: Sat, Nov 7 at Panera" class="mt-1 w-full rounded-lg bg-bc-dark border border-slate-600 px-4 py-3 text-white">
             </label>
             <label class="block"><span class="text-sm font-semibold">Heading <span class="text-slate-500 font-normal">optional</span></span>
-              <input id="quick-email-heading" maxlength="150" placeholder="(defaults to the subject line)" class="mt-1 w-full rounded-lg bg-bc-dark border border-slate-600 px-4 py-3 text-white">
+              <input id="message-draft-heading" maxlength="150" placeholder="(defaults to the subject line)" class="mt-1 w-full rounded-lg bg-bc-dark border border-slate-600 px-4 py-3 text-white">
             </label>
             <div>
-              <span id="quick-email-message-label" class="text-sm font-semibold">Message</span>
-              <div id="quick-email-editor" contenteditable="true" role="textbox" aria-multiline="true" aria-labelledby="quick-email-message-label" data-empty="true" data-placeholder="Write your message here.&#10;&#10;Click or drag a field below to personalize it, or drop an image in." class="qe-editor mt-1 rounded-t-lg bg-bc-dark border border-slate-600 px-4 py-3 text-white"></div>
-              <div id="quick-email-insert-bar" class="flex flex-wrap items-center gap-2 rounded-b-lg border border-t-0 border-slate-600 bg-slate-900/80 px-3 py-2">
+              <span id="message-draft-message-label" class="text-sm font-semibold">Message</span>
+              <div id="message-draft-editor" contenteditable="true" role="textbox" aria-multiline="true" aria-labelledby="message-draft-message-label" data-empty="true" data-placeholder="Write your message here.&#10;&#10;Click or drag a field below to personalize it, or drop an image in." class="msg-editor mt-1 rounded-t-lg bg-bc-dark border border-slate-600 px-4 py-3 text-white"></div>
+              <div id="message-draft-insert-bar" class="flex flex-wrap items-center gap-2 rounded-b-lg border border-t-0 border-slate-600 bg-slate-900/80 px-3 py-2">
                 <span class="mr-1 text-xs font-semibold text-slate-400">Insert</span>
-                <button type="button" draggable="true" data-quick-email-insert="{{{contact.first_name|there}}}" title="Click or drag into the message" class="qe-chip">First name</button>
-                <button type="button" draggable="true" data-quick-email-insert="{{{contact.last_name}}}" title="Click or drag into the message" class="qe-chip">Last name</button>
-                <button type="button" draggable="true" data-quick-email-insert="{{{contact.email}}}" title="Click or drag into the message" class="qe-chip">Email</button>
-                <button id="quick-email-image-button" type="button" class="rounded-full border border-slate-600 px-3 py-1 text-xs font-bold text-slate-200 hover:border-bc-cyan hover:text-bc-cyan">+ Image</button>
-                <input id="quick-email-image-file" type="file" accept="image/png,image/jpeg,image/gif,image/webp" class="hidden">
+                <button type="button" draggable="true" data-message-field="{{{contact.first_name|there}}}" title="Click or drag into the message" class="msg-chip">First name</button>
+                <button type="button" draggable="true" data-message-field="{{{contact.last_name}}}" title="Click or drag into the message" class="msg-chip">Last name</button>
+                <button type="button" draggable="true" data-message-field="{{{contact.email}}}" title="Click or drag into the message" class="msg-chip">Email</button>
+                <button id="message-draft-image-button" type="button" class="rounded-full border border-slate-600 px-3 py-1 text-xs font-bold text-slate-200 hover:border-bc-cyan hover:text-bc-cyan">+ Image</button>
+                <input id="message-draft-image-file" type="file" accept="image/png,image/jpeg,image/gif,image/webp" class="hidden">
                 <span class="ml-auto text-xs text-slate-500">Click or drag</span>
               </div>
             </div>
@@ -380,14 +381,74 @@
               <p class="text-xs text-slate-400">This screen only creates the draft. Review recipients and send from Resend.</p>
             </div>
             <div class="flex flex-wrap gap-3">
-              <button id="quick-email-preview" type="button" class="border border-bc-cyan text-bc-cyan px-5 py-3 rounded-lg font-bold hover:bg-bc-cyan hover:text-bc-dark">Preview email</button>
-              <button id="quick-email-create-draft" type="button" class="bg-bc-cyan text-bc-dark px-5 py-3 rounded-lg font-bold hover:bg-cyan-400 disabled:opacity-50">Create Resend draft</button>
+              <button id="message-draft-preview" type="button" class="border border-bc-cyan text-bc-cyan px-5 py-3 rounded-lg font-bold hover:bg-bc-cyan hover:text-bc-dark">Preview email</button>
+              <button id="message-draft-create-draft" type="button" class="bg-bc-cyan text-bc-dark px-5 py-3 rounded-lg font-bold hover:bg-cyan-400 disabled:opacity-50">Create Resend draft</button>
             </div>
-            <p id="quick-email-status" class="text-sm text-slate-300"></p>
+            <p id="message-draft-status" class="text-sm text-slate-300"></p>
           </div>
           <div>
             <p class="text-sm font-semibold text-slate-300 mb-2">Preview</p>
-            <iframe id="quick-email-preview-frame" class="w-full h-[520px] rounded-2xl border border-slate-700 bg-white" title="Email preview"></iframe>
+            <iframe id="message-draft-preview-frame" class="w-full h-[520px] rounded-2xl border border-slate-700 bg-white" title="Email preview"></iframe>
+          </div>
+        </div>
+      </section>
+
+      <section id="blog-posts" data-admin-section="blog" class="hidden bg-bc-navy border border-slate-700 rounded-2xl p-6 mt-8">
+        <div class="mb-4 flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <h2 class="text-2xl font-black">Blog posts</h2>
+            <p class="text-sm text-slate-400 mt-1">Write, preview, and publish posts on hackthevalley.org/blog. Publishing makes a post public right away, and Unpublish takes it down.</p>
+          </div>
+          <button id="blog-new-post" type="button" class="bg-bc-cyan text-bc-dark px-5 py-3 rounded-lg font-bold hover:bg-cyan-400">New post</button>
+        </div>
+        <div id="blog-post-list" class="overflow-x-auto text-sm text-slate-300"></div>
+      </section>
+
+      <section id="blog-editor" data-admin-section="blog" class="hidden bg-bc-navy border border-slate-700 rounded-2xl p-6 mt-8">
+        <div class="mb-4">
+          <h2 id="blog-editor-heading" class="text-2xl font-black">New post</h2>
+          <p id="blog-editor-state" class="text-sm text-slate-400 mt-1">Not saved yet</p>
+        </div>
+        <div class="grid lg:grid-cols-[1fr_1.2fr] gap-6">
+          <div class="space-y-4">
+            <label class="block"><span class="text-sm font-semibold">Title</span>
+              <input id="blog-title" maxlength="150" placeholder="Project Spotlight: TechPath Kern" class="mt-1 w-full rounded-lg bg-bc-dark border border-slate-600 px-4 py-3 text-white">
+            </label>
+            <div>
+              <label class="block"><span class="text-sm font-semibold">URL</span>
+                <span class="mt-1 flex items-center rounded-lg bg-bc-dark border border-slate-600 px-4">
+                  <span class="whitespace-nowrap text-sm text-slate-500">hackthevalley.org/blog/</span>
+                  <input id="blog-slug" maxlength="80" placeholder="project-spotlight-techpath-kern" class="w-full bg-transparent py-3 text-white outline-none">
+                </span>
+              </label>
+              <p id="blog-slug-note" class="mt-1 text-xs text-slate-400">Fills in from the title until you edit it.</p>
+            </div>
+            <label class="block"><span class="text-sm font-semibold">Summary <span class="text-slate-500 font-normal">shown on the blog list</span></span>
+              <textarea id="blog-summary" rows="2" maxlength="300" class="mt-1 w-full rounded-lg bg-bc-dark border border-slate-600 px-4 py-3 text-white"></textarea>
+            </label>
+            <div>
+              <span id="blog-body-label" class="text-sm font-semibold">Post</span>
+              <div id="blog-body-editor" contenteditable="true" role="textbox" aria-multiline="true" aria-labelledby="blog-body-label" data-empty="true" data-placeholder="Write the post here.&#10;&#10;Start a line with ## for a heading, and drop or paste images in." class="msg-editor mt-1 rounded-t-lg bg-bc-dark border border-slate-600 px-4 py-3 text-white"></div>
+              <div class="flex flex-wrap items-center gap-2 rounded-b-lg border border-t-0 border-slate-600 bg-slate-900/80 px-3 py-2">
+                <span class="mr-1 text-xs font-semibold text-slate-400">Insert</span>
+                <button id="blog-image-button" type="button" class="rounded-full border border-slate-600 px-3 py-1 text-xs font-bold text-slate-200 hover:border-bc-cyan hover:text-bc-cyan">+ Image</button>
+                <input id="blog-image-file" type="file" accept="image/png,image/jpeg,image/gif,image/webp" class="hidden">
+                <span class="ml-auto text-xs text-slate-500">Personalized fields are email-only</span>
+              </div>
+            </div>
+            <p class="text-xs text-slate-400">Enter starts a new line and a blank line starts a new paragraph. Lines starting with "## " become headings and "- " bullets, and links become clickable. Images can be added, dropped, or pasted in, then resized.</p>
+            <div class="flex flex-wrap gap-3">
+              <button id="blog-save" type="button" class="border border-slate-500 text-slate-100 px-5 py-3 rounded-lg font-bold hover:border-bc-cyan">Save draft</button>
+              <button id="blog-preview" type="button" class="border border-bc-cyan text-bc-cyan px-5 py-3 rounded-lg font-bold hover:bg-bc-cyan hover:text-bc-dark">Preview</button>
+              <button id="blog-publish" type="button" class="bg-bc-cyan text-bc-dark px-5 py-3 rounded-lg font-bold hover:bg-cyan-400">Publish</button>
+              <button id="blog-unpublish" type="button" class="hidden border border-red-400/60 text-red-200 px-5 py-3 rounded-lg font-bold hover:border-red-300">Unpublish</button>
+              <a id="blog-view" href="#" target="_blank" rel="noopener" class="hidden self-center text-sm text-bc-cyan underline">View on site</a>
+            </div>
+            <p id="blog-status" class="text-sm text-slate-300"></p>
+          </div>
+          <div>
+            <p class="text-sm font-semibold text-slate-300 mb-2">Preview</p>
+            <iframe id="blog-preview-frame" class="w-full h-[640px] rounded-2xl border border-slate-700 bg-bc-dark" title="Blog post preview"></iframe>
           </div>
         </div>
       </section>
@@ -433,7 +494,9 @@
       "helper-interest-admin": "people",
       "physical-resources-admin": "resources",
       "physical-resource-form": "resources",
-      "quick-email": "blog",
+      "message-draft": "email",
+      "blog-posts": "blog",
+      "blog-editor": "blog",
       "role-admin": "access"
     };
 
@@ -475,7 +538,7 @@
 
     function adminSectionFromHash(hash = window.location.hash) {
       const target = String(hash || "").replace(/^#/, "");
-      return ADMIN_SECTION_TARGETS[target] || (["dashboard", "live-ops", "events", "people", "resources", "blog", "access"].includes(target) ? target : "dashboard");
+      return ADMIN_SECTION_TARGETS[target] || (["dashboard", "live-ops", "events", "people", "resources", "email", "blog", "access"].includes(target) ? target : "dashboard");
     }
 
     function setAdminNavState(section) {
@@ -1776,6 +1839,7 @@
 
     checkAdminSession({ loadData: true }).catch((error) => showLogin(error.message, true));
   </script>
-  <script type="module" src="/admin-quick-email.js"></script>
+  <script type="module" src="/admin-message-draft.js"></script>
+  <script type="module" src="/admin-blog-posts.js"></script>
 </body>
 </html>

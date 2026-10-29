@@ -3,18 +3,19 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 import worker from '../worker.js';
+import { MESSAGE_FIELDS, MESSAGE_IMAGE_WIDTH, messageBodyHtml } from '../functions/_shared/message-format.js';
 import {
-  EMAIL_IMAGE_MAX_BYTES,
-  EMAIL_IMAGE_WIDTH,
-  QUICK_EMAIL_FIELDS,
-  emailImageKey,
-  prepareEmailImageUpload,
-  quickEmailBodyHtml,
-} from '../functions/_shared/quick-email.js';
-import * as composer from '../public/admin-quick-email.js';
-import { createDraftEmail } from '../functions/_lib/domain/blog-broadcast.js';
-import { onRequestPost, onRequest } from '../functions/api/admin/quick-email.js';
-import { onRequestPost as uploadImage } from '../functions/api/admin/quick-email/images.js';
+  MESSAGE_IMAGE_MAX_BYTES,
+  MessageDraft,
+  createResendDraft,
+  messageImageKey,
+  prepareMessageImage,
+} from '../functions/_lib/domain/message-draft.js';
+import { createDraftEmail } from '../functions/_shared/resend-broadcasts.js';
+import * as messageEditor from '../public/admin-message-editor.js';
+import * as messageDraftComposer from '../public/admin-message-draft.js';
+import { onRequestPost, onRequest } from '../functions/api/admin/message-drafts/index.js';
+import { onRequestPost as uploadImage } from '../functions/api/admin/message-drafts/images.js';
 import { onRequestGet as getImage } from '../functions/api/email-images/[name].js';
 
 // --- helpers ---------------------------------------------------------------
@@ -30,9 +31,13 @@ function mockFetch(responses, calls = []) {
   };
 }
 
-// Session + role lookups only; quick emails never touch the send-log table.
-function adminDb({ role = 'admin' } = {}) {
+// Session + role lookups, plus an in-memory message_draft_receipts table so the
+// idempotency path is exercised. Pass a shared `receipts` Map to keep state
+// across requests.
+function adminDb({ role = 'admin', receipts = new Map() } = {}) {
+  const receiptKey = (args) => `${args[0]}::${args[1]}`;
   return {
+    receipts,
     prepare(sql) {
       return {
         args: [],
@@ -44,24 +49,50 @@ function adminDb({ role = 'admin' } = {}) {
           if (/FROM roles/.test(sql)) {
             return role && this.args.includes(role) ? { role, scope_type: 'global', scope_id: '*', created_at: '2026-01-01T00:00:00.000Z' } : null;
           }
+          if (/FROM message_draft_receipts/.test(sql)) return receipts.get(receiptKey(this.args)) || null;
+          if (/FROM blog_posts/.test(sql)) return null;
           throw new Error(`Unexpected first() query: ${sql}`);
         },
-        async run() { throw new Error(`Unexpected run() query: ${sql}`); },
+        async run() {
+          if (/INSERT INTO message_draft_receipts/.test(sql)) {
+            const [actor, key, fingerprint, created_at, updated_at] = this.args;
+            if (receipts.has(receiptKey(this.args))) throw new Error('UNIQUE constraint failed: message_draft_receipts');
+            receipts.set(receiptKey(this.args), { actor_user_id: actor, idempotency_key: key, fingerprint, status: 'pending', created_at, updated_at });
+            return { success: true };
+          }
+          if (/UPDATE message_draft_receipts/.test(sql)) {
+            const [broadcast_id, response_json, updated_at, actor, key] = this.args;
+            Object.assign(receipts.get(`${actor}::${key}`), { status: 'created', broadcast_id, response_json, updated_at });
+            return { success: true };
+          }
+          if (/DELETE FROM message_draft_receipts/.test(sql)) {
+            receipts.delete(receiptKey(this.args));
+            return { success: true };
+          }
+          throw new Error(`Unexpected run() query: ${sql}`);
+        },
         async all() { return { results: [] }; },
       };
     },
   };
 }
 
-function quickEmailRequest(body, { cookie } = {}) {
+function draftRequest(body, { cookie, key } = {}) {
   const headers = { 'content-type': 'application/json' };
   if (cookie) headers.cookie = cookie;
-  return new Request('https://hackthevalley.org/api/admin/quick-email', {
+  if (key) headers['idempotency-key'] = key;
+  return new Request('https://hackthevalley.org/api/admin/message-drafts', {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
   });
 }
+
+const DRAFT_KEY = 'draft-key-0001';
+const segmentsThenCreate = (id) => [
+  { status: 200, body: { data: [{ id: 'seg_general', name: 'General' }] } },
+  { status: 200, body: { id } },
+];
 
 const RESEND_ENV = { RESEND_API_KEY: 'k', RESEND_BROADCAST_FROM: 'HTV <a@b.co>' };
 
@@ -74,8 +105,13 @@ function mockBucket() {
   return {
     objects,
     reads,
+    puts: 0,
     async put(key, value, options = {}) {
+      this.puts += 1;
       objects.set(key, { bytes: new Uint8Array(value), ...options });
+    },
+    async head(key) {
+      return objects.has(key) ? { key } : null;
     },
     async get(key) {
       reads.push(key);
@@ -94,107 +130,111 @@ function mockBucket() {
 function imageUploadRequest(bytes, { contentType = 'image/png', cookie } = {}) {
   const headers = { 'content-type': contentType, 'x-filename': 'hack-hours-flyer.png' };
   if (cookie) headers.cookie = cookie;
-  return new Request('https://hackthevalley.org/api/admin/quick-email/images', { method: 'POST', headers, body: bytes });
+  return new Request('https://hackthevalley.org/api/admin/message-drafts/images', { method: 'POST', headers, body: bytes });
 }
 
 // --- message rendering -----------------------------------------------------
 
-test('quickEmailBodyHtml turns blank lines into paragraphs and line breaks into <br>', () => {
+test('messageBodyHtml turns blank lines into paragraphs and line breaks into <br>', () => {
   assert.equal(
-    quickEmailBodyHtml('Hello there,\nsecond line\n\n\nNew paragraph'),
+    messageBodyHtml('Hello there,\nsecond line\n\n\nNew paragraph'),
     '<p>Hello there,<br>second line</p>\n<p>New paragraph</p>',
   );
 });
 
-test('quickEmailBodyHtml renders "- " and "* " lines as bullets, even after a lead-in line', () => {
+test('messageBodyHtml renders "- " and "* " lines as bullets, even after a lead-in line', () => {
   assert.equal(
-    quickEmailBodyHtml('Details:\n- When: Sat, Nov 7\n* Where: Panera'),
+    messageBodyHtml('Details:\n- When: Sat, Nov 7\n* Where: Panera'),
     '<p>Details:</p>\n<ul><li>When: Sat, Nov 7</li><li>Where: Panera</li></ul>',
   );
 });
 
-test('quickEmailBodyHtml escapes markup and links http(s) URLs without trailing punctuation', () => {
-  const html = quickEmailBodyHtml('Sign up <b>now</b>: https://hackthevalley.org/events/hack-hours/. Food & fun, see https://x.org/a?b=1&c=2');
+test('messageBodyHtml escapes markup and links http(s) URLs without trailing punctuation', () => {
+  const html = messageBodyHtml('Sign up <b>now</b>: https://hackthevalley.org/events/hack-hours/. Food & fun, see https://x.org/a?b=1&c=2');
   assert.match(html, /&lt;b&gt;now&lt;\/b&gt;/);
   assert.match(html, /<a href="https:\/\/hackthevalley\.org\/events\/hack-hours\/">https:\/\/hackthevalley\.org\/events\/hack-hours\/<\/a>\./);
   assert.match(html, /Food &amp; fun/);
   assert.match(html, /<a href="https:\/\/x\.org\/a\?b=1&amp;c=2">/);
 });
 
-test('quickEmailBodyHtml never links non-http schemes and keeps Resend personalization tokens', () => {
-  const html = quickEmailBodyHtml('Hi {{{contact.first_name|there}}} ({{{contact.email}}}), javascript:alert(1)');
+test('messageBodyHtml never links non-http schemes and keeps Resend personalization tokens', () => {
+  const html = messageBodyHtml('Hi {{{contact.first_name|there}}} ({{{contact.email}}}), javascript:alert(1)');
   assert.doesNotMatch(html, /<a /);
   assert.match(html, /\{\{\{contact\.first_name\|there\}\}\}/);
   assert.match(html, /\{\{\{contact\.email\}\}\}/);
 });
 
-test('quickEmailBodyHtml renders an "![alt](url)" line as its own image', () => {
+test('messageBodyHtml renders an "![alt](url)" line as its own image', () => {
   assert.equal(
-    quickEmailBodyHtml(`Flyer below:\n![Hack Hours flyer](/api/email-images/${IMAGE_NAME})\nSee you!`),
+    messageBodyHtml(`Flyer below:\n![Hack Hours flyer](/api/email-images/${IMAGE_NAME})\nSee you!`),
     `<p>Flyer below:</p>\n<p><img src="/api/email-images/${IMAGE_NAME}" alt="Hack Hours flyer"></p>\n<p>See you!</p>`,
   );
-  assert.match(quickEmailBodyHtml('![Logo](https://hackthevalley.org/images/logo.png)'), /<img src="https:\/\/hackthevalley\.org\/images\/logo\.png" alt="Logo">/);
+  assert.match(messageBodyHtml('![Logo](https://hackthevalley.org/images/logo.png)'), /<img src="https:\/\/hackthevalley\.org\/images\/logo\.png" alt="Logo">/);
 });
 
-test('quickEmailBodyHtml sizes images with {width=N}, clamped to the email body width', () => {
-  assert.equal(quickEmailBodyHtml('![Flyer](/a.png){width=360}'), '<p><img src="/a.png" alt="Flyer" width="360"></p>');
-  assert.match(quickEmailBodyHtml('![Flyer](/a.png){width=20}'), new RegExp(`width="${EMAIL_IMAGE_WIDTH.min}"`));
-  assert.match(quickEmailBodyHtml('![Flyer](/a.png){width=9999}'), new RegExp(`width="${EMAIL_IMAGE_WIDTH.max}"`));
+test('messageBodyHtml sizes images with {width=N}, clamped to the email body width', () => {
+  assert.equal(messageBodyHtml('![Flyer](/a.png){width=360}'), '<p><img src="/a.png" alt="Flyer" width="360"></p>');
+  assert.match(messageBodyHtml('![Flyer](/a.png){width=20}'), new RegExp(`width="${MESSAGE_IMAGE_WIDTH.min}"`));
+  assert.match(messageBodyHtml('![Flyer](/a.png){width=9999}'), new RegExp(`width="${MESSAGE_IMAGE_WIDTH.max}"`));
 });
 
-test('quickEmailBodyHtml renders ## headings, [text](url) links, and **bold**', () => {
+test('messageBodyHtml renders ## headings, [text](url) links, and **bold**', () => {
   assert.equal(
-    quickEmailBodyHtml('## What it does\n### Details\nRead **this** [on the blog](/blog/x) or https://a.org.'),
+    messageBodyHtml('## What it does\n### Details\nRead **this** [on the blog](/blog/x) or https://a.org.'),
     '<h2>What it does</h2>\n<h3>Details</h3>\n<p>Read <strong>this</strong> <a href="/blog/x">on the blog</a> or <a href="https://a.org">https://a.org</a>.</p>',
   );
 });
 
-test('quickEmailBodyHtml escapes link text and refuses unsafe link targets', () => {
-  const html = quickEmailBodyHtml('[<b>x</b>](https://a.org/?q=1&r=2) [bad](javascript:alert(1)) [proto](//evil.example) **<i>y</i>**');
+test('messageBodyHtml escapes link text and refuses unsafe link targets', () => {
+  const html = messageBodyHtml('[<b>x</b>](https://a.org/?q=1&r=2) [bad](javascript:alert(1)) [proto](//evil.example) **<i>y</i>**');
   assert.match(html, /<a href="https:\/\/a\.org\/\?q=1&amp;r=2">&lt;b&gt;x&lt;\/b&gt;<\/a>/);
   assert.match(html, /\[bad\]\(javascript:alert\(1\)\)/);
   assert.match(html, /\[proto\]\(\/\/evil\.example\)/);
   assert.match(html, /<strong>&lt;i&gt;y&lt;\/i&gt;<\/strong>/);
 });
 
-test('quickEmailBodyHtml escapes image alt text and refuses non-http image sources', () => {
-  assert.match(quickEmailBodyHtml('![a "quote" <b>](https://x.org/a.png)'), /alt="a &quot;quote&quot; &lt;b&gt;"/);
+test('messageBodyHtml escapes image alt text and refuses non-http image sources', () => {
+  assert.match(messageBodyHtml('![a "quote" <b>](https://x.org/a.png)'), /alt="a &quot;quote&quot; &lt;b&gt;"/);
   for (const line of ['![x](data:image/png;base64,AAAA)', '![x](//evil.example/a.png)', '![x](javascript:alert(1))']) {
-    assert.doesNotMatch(quickEmailBodyHtml(line), /<img/, line);
+    assert.doesNotMatch(messageBodyHtml(line), /<img/, line);
   }
 });
 
 // --- uploaded images -------------------------------------------------------
 
-test('prepareEmailImageUpload names PNG/JPEG/GIF uploads under email-images/', () => {
-  const upload = prepareEmailImageUpload({ contentType: 'image/png', bytes: PNG_BYTES, id: 'img_0123456789abcdef' });
-  assert.deepEqual(upload, {
-    name: IMAGE_NAME,
-    key: `email-images/${IMAGE_NAME}`,
+const sha16 = async (bytes) => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)), (b) => b.toString(16).padStart(2, '0')).join('').slice(0, 16);
+
+test('prepareMessageImage names an image after its content, under email-images/', async () => {
+  const name = `img_${await sha16(PNG_BYTES)}.png`;
+  assert.deepEqual(await prepareMessageImage({ contentType: 'image/png', bytes: PNG_BYTES }), {
+    name,
+    key: `email-images/${name}`,
     contentType: 'image/png',
-    url: `/api/email-images/${IMAGE_NAME}`,
+    url: `/api/email-images/${name}`,
   });
   const jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0]);
-  assert.equal(prepareEmailImageUpload({ contentType: 'image/jpeg', bytes: jpeg, id: 'img_0123456789abcdef' }).name, 'img_0123456789abcdef.jpg');
+  assert.match((await prepareMessageImage({ contentType: 'image/jpeg', bytes: jpeg })).name, /^img_[a-f0-9]{16}\.jpg$/);
+  const other = new Uint8Array([...PNG_BYTES, 9]);
+  assert.notEqual((await prepareMessageImage({ contentType: 'image/png', bytes: other })).name, name, 'different content, different name');
 });
 
-test('prepareEmailImageUpload rejects other types, mismatched bytes, empty, and oversized files', () => {
+test('prepareMessageImage rejects other types, mismatched bytes, empty, and oversized files', async () => {
   const cases = [
     { contentType: 'image/webp', bytes: PNG_BYTES },
     { contentType: 'image/svg+xml', bytes: new TextEncoder().encode('<svg/>') },
     { contentType: 'image/png', bytes: new TextEncoder().encode('<html>not an image</html>') },
     { contentType: 'image/png', bytes: new Uint8Array(0) },
-    { contentType: 'image/png', bytes: Object.assign(new Uint8Array(EMAIL_IMAGE_MAX_BYTES + 1), PNG_BYTES) },
+    { contentType: 'image/png', bytes: Object.assign(new Uint8Array(MESSAGE_IMAGE_MAX_BYTES + 1), PNG_BYTES) },
   ];
   for (const input of cases) {
-    assert.throws(() => prepareEmailImageUpload({ ...input, id: 'img_0123456789abcdef' }), (error) => error.status === 400, input.contentType);
+    await assert.rejects(prepareMessageImage(input), (error) => error.status === 400, input.contentType);
   }
 });
 
-test('emailImageKey only resolves generated image names', () => {
-  assert.equal(emailImageKey(IMAGE_NAME), `email-images/${IMAGE_NAME}`);
+test('messageImageKey only resolves generated image names', () => {
+  assert.equal(messageImageKey(IMAGE_NAME), `email-images/${IMAGE_NAME}`);
   for (const name of ['../submissions/x.png', 'email-images/x.png', 'img_123.png', 'img_0123456789abcdef.svg', '', undefined]) {
-    assert.equal(emailImageKey(name), null, String(name));
+    assert.equal(messageImageKey(name), null, String(name));
   }
 });
 
@@ -213,13 +253,29 @@ test('image upload stores an admin image in R2 and returns its public URL', asyn
   });
   assert.equal(response.status, 200);
   const body = await response.json();
-  assert.match(body.url, /^\/api\/email-images\/img_[a-f0-9]{16}\.png$/);
+  assert.equal(body.name, `img_${await sha16(PNG_BYTES)}.png`);
+  assert.equal(body.url, `/api/email-images/${body.name}`);
+  assert.equal(body.reused, false);
   const stored = bucket.objects.get(`email-images/${body.name}`);
   assert.ok(stored, 'image stored under email-images/');
   assert.deepEqual([...stored.bytes], [...PNG_BYTES]);
   assert.equal(stored.httpMetadata.contentType, 'image/png');
   assert.equal(stored.customMetadata.kind, 'email-image');
   assert.equal(stored.customMetadata.uploadedBy, 'admin@example.com');
+});
+
+test('uploading the same image again is idempotent: same URL, no second copy', async () => {
+  const bucket = mockBucket();
+  const upload = () => uploadImage({
+    request: imageUploadRequest(PNG_BYTES, { cookie: 'htv_session=tok' }),
+    env: { HTV_DB: adminDb(), SUBMISSIONS_MEDIA: bucket },
+  }).then((response) => response.json());
+  const first = await upload();
+  const second = await upload();
+  assert.equal(second.url, first.url);
+  assert.equal(second.reused, true);
+  assert.equal(bucket.puts, 1);
+  assert.equal(bucket.objects.size, 1);
 });
 
 test('image upload refuses files that are not PNG/JPEG/GIF', async () => {
@@ -263,8 +319,8 @@ test('worker routes the image upload and public image endpoints', async () => {
   assert.equal(image.headers.get('content-type'), 'image/png');
 });
 
-test('quickEmailBodyHtml returns an empty string for an empty message', () => {
-  assert.equal(quickEmailBodyHtml('  \n\n '), '');
+test('messageBodyHtml returns an empty string for an empty message', () => {
+  assert.equal(messageBodyHtml('  \n\n '), '');
 });
 
 // --- domain ----------------------------------------------------------------
@@ -272,7 +328,7 @@ test('quickEmailBodyHtml returns an empty string for an empty message', () => {
 test('createDraftEmail creates a Resend draft without a post slug and never calls send', async () => {
   const calls = [];
   const result = await createDraftEmail({
-    subject: 's', name: 'Quick email: s', html: '<p>e</p>',
+    subject: 's', name: 'Email: s', html: '<p>e</p>',
     env: RESEND_ENV,
     fetcher: mockFetch([
       { status: 200, body: { data: [{ id: 'seg_general', name: 'General' }] } },
@@ -287,41 +343,41 @@ test('createDraftEmail creates a Resend draft without a post slug and never call
 
 // --- route -----------------------------------------------------------------
 
-test('worker routes /api/admin/quick-email and rejects non-admins with 401', async () => {
-  const response = await worker.fetch(quickEmailRequest({ subject: 's', message: 'm' }), { HTV_DB: {} });
+test('worker routes /api/admin/message-drafts and rejects non-admins with 401', async () => {
+  const response = await worker.fetch(draftRequest({ subject: 's', message: 'm' }), { HTV_DB: {} });
   assert.equal(response.status, 401);
 });
 
-test('quick email handler rejects non-admins with 401', async () => {
+test('message draft handler rejects non-admins with 401', async () => {
   const response = await onRequestPost({
-    request: quickEmailRequest({ subject: 's', message: 'm' }),
+    request: draftRequest({ subject: 's', message: 'm' }),
     env: { HTV_DB: {} },
   });
   assert.equal(response.status, 401);
 });
 
-test('quick email handler requires a subject and a message', async () => {
+test('message draft handler requires a subject and a message', async () => {
   for (const body of [{ message: 'm' }, { subject: 's' }, { subject: '   ', message: 'm' }]) {
     const response = await onRequestPost({
-      request: quickEmailRequest({ ...body, dryRun: true }, { cookie: 'htv_session=tok' }),
+      request: draftRequest({ ...body, dryRun: true }, { cookie: 'htv_session=tok' }),
       env: { HTV_DB: adminDb() },
     });
     assert.equal(response.status, 400, JSON.stringify(body));
   }
 });
 
-test('quick email handler rejects an over-long subject', async () => {
+test('message draft handler rejects an over-long subject', async () => {
   const response = await onRequestPost({
-    request: quickEmailRequest({ subject: 'x'.repeat(151), message: 'm', dryRun: true }, { cookie: 'htv_session=tok' }),
+    request: draftRequest({ subject: 'x'.repeat(151), message: 'm', dryRun: true }, { cookie: 'htv_session=tok' }),
     env: { HTV_DB: adminDb() },
   });
   assert.equal(response.status, 400);
 });
 
-test('quick email dry run renders the blog email chrome without calling Resend', async () => {
+test('message draft dry run renders the blog email chrome without calling Resend', async () => {
   const calls = [];
   const response = await onRequestPost({
-    request: quickEmailRequest({ subject: 'Hack Hours is back', message: 'See you Saturday.\n\n- When: 9 AM', dryRun: true }, { cookie: 'htv_session=tok' }),
+    request: draftRequest({ subject: 'Hack Hours is back', message: 'See you Saturday.\n\n- When: 9 AM', dryRun: true }, { cookie: 'htv_session=tok' }),
     env: { HTV_DB: adminDb() },
     fetch: mockFetch([], calls),
   });
@@ -339,9 +395,9 @@ test('quick email dry run renders the blog email chrome without calling Resend',
   assert.equal(calls.length, 0, 'dry run must not hit Resend');
 });
 
-test('quick email dry run makes uploaded image URLs absolute and sizes them for email', async () => {
+test('message draft dry run makes uploaded image URLs absolute and sizes them for email', async () => {
   const response = await onRequestPost({
-    request: quickEmailRequest({ subject: 's', message: `![Flyer](/api/email-images/${IMAGE_NAME})`, dryRun: true }, { cookie: 'htv_session=tok' }),
+    request: draftRequest({ subject: 's', message: `![Flyer](/api/email-images/${IMAGE_NAME})`, dryRun: true }, { cookie: 'htv_session=tok' }),
     env: { HTV_DB: adminDb() },
   });
   const body = await response.json();
@@ -359,7 +415,7 @@ const POST_ASSETS = {
 
 test('an email started from a blog post links back to the post and is named after it', async () => {
   const preview = await onRequestPost({
-    request: quickEmailRequest({ subject: 's', message: 'Read [the post](/blog/spotlight).', postSlug: 'spotlight', dryRun: true }, { cookie: 'htv_session=tok' }),
+    request: draftRequest({ subject: 's', message: 'Read [the post](/blog/spotlight).', postSlug: 'spotlight', dryRun: true }, { cookie: 'htv_session=tok' }),
     env: { HTV_DB: adminDb(), ASSETS: POST_ASSETS },
   });
   const previewBody = await preview.json();
@@ -368,7 +424,7 @@ test('an email started from a blog post links back to the post and is named afte
 
   const calls = [];
   const draft = await onRequestPost({
-    request: quickEmailRequest({ subject: 's', message: 'm', postSlug: 'spotlight' }, { cookie: 'htv_session=tok' }),
+    request: draftRequest({ subject: 's', message: 'm', postSlug: 'spotlight' }, { cookie: 'htv_session=tok', key: DRAFT_KEY }),
     env: { HTV_DB: adminDb(), ASSETS: POST_ASSETS, ...RESEND_ENV },
     fetch: mockFetch([
       { status: 200, body: { data: [{ id: 'seg_general', name: 'General' }] } },
@@ -382,7 +438,7 @@ test('an email started from a blog post links back to the post and is named afte
 test('an email for an unknown blog post is refused before anything reaches Resend', async () => {
   const calls = [];
   const response = await onRequestPost({
-    request: quickEmailRequest({ subject: 's', message: 'm', postSlug: 'missing' }, { cookie: 'htv_session=tok' }),
+    request: draftRequest({ subject: 's', message: 'm', postSlug: 'missing' }, { cookie: 'htv_session=tok' }),
     env: { HTV_DB: adminDb(), ASSETS: POST_ASSETS, ...RESEND_ENV },
     fetch: mockFetch([], calls),
   });
@@ -390,9 +446,9 @@ test('an email for an unknown blog post is refused before anything reaches Resen
   assert.equal(calls.length, 0);
 });
 
-test('quick email heading overrides the email title but not the subject', async () => {
+test('message draft heading overrides the email title but not the subject', async () => {
   const response = await onRequestPost({
-    request: quickEmailRequest({ subject: 'Subject line', heading: 'Big heading', message: 'm', dryRun: true }, { cookie: 'htv_session=tok' }),
+    request: draftRequest({ subject: 'Subject line', heading: 'Big heading', message: 'm', dryRun: true }, { cookie: 'htv_session=tok' }),
     env: { HTV_DB: adminDb() },
   });
   const body = await response.json();
@@ -400,15 +456,12 @@ test('quick email heading overrides the email title but not the subject', async 
   assert.match(body.html, /<h1[^>]*>Big heading<\/h1>/);
 });
 
-test('quick email handler creates a Resend draft for an admin and never calls send', async () => {
+test('message draft handler creates a Resend draft for an admin and never calls send', async () => {
   const calls = [];
   const response = await onRequestPost({
-    request: quickEmailRequest({ subject: 'Hack Hours is back', message: 'See you Saturday.' }, { cookie: 'htv_session=tok' }),
+    request: draftRequest({ subject: 'Hack Hours is back', message: 'See you Saturday.' }, { cookie: 'htv_session=tok', key: DRAFT_KEY }),
     env: { HTV_DB: adminDb(), ...RESEND_ENV },
-    fetch: mockFetch([
-      { status: 200, body: { data: [{ id: 'seg_general', name: 'General' }] } },
-      { status: 200, body: { id: 'bc_quick' } },
-    ], calls),
+    fetch: mockFetch(segmentsThenCreate('bc_quick'), calls),
   });
   assert.equal(response.status, 200);
   const body = await response.json();
@@ -416,27 +469,102 @@ test('quick email handler creates a Resend draft for an admin and never calls se
   assert.equal(body.broadcastId, 'bc_quick');
   assert.equal(body.status, 'draft');
   assert.equal(body.scheduled, false);
+  assert.equal(body.replayed, false);
   assert.equal(body.needsRecipientReview, true);
   assert.equal(calls.length, 2);
   assert.equal(calls[1].url, 'https://api.resend.com/broadcasts');
-  assert.ok(!calls.some((call) => String(call.url).includes('/send')), 'quick email must never call Resend /send');
+  assert.ok(!calls.some((call) => String(call.url).includes('/send')), 'drafts must never call Resend /send');
   const createBody = JSON.parse(calls[1].init.body);
   assert.equal(createBody.subject, 'Hack Hours is back');
-  assert.equal(createBody.name, 'Quick email: Hack Hours is back');
+  assert.equal(createBody.name, 'Email: Hack Hours is back');
   assert.match(createBody.html, /See you Saturday\./);
   assert.deepEqual(createBody.reply_to, ['contact@hackthevalley.org']);
 });
 
-test('quick email handler returns 503 when Resend is not configured', async () => {
+test('retrying a draft with the same key and content replays it instead of creating a duplicate', async () => {
+  const db = adminDb();
+  const calls = [];
+  const send = () => onRequestPost({
+    request: draftRequest({ subject: 'Hack Hours is back', message: 'See you Saturday.' }, { cookie: 'htv_session=tok', key: DRAFT_KEY }),
+    env: { HTV_DB: db, ...RESEND_ENV },
+    fetch: mockFetch(segmentsThenCreate('bc_once'), calls),
+  }).then((response) => response.json());
+  const first = await send();
+  const retry = await send();
+  assert.equal(first.replayed, false);
+  assert.equal(retry.replayed, true);
+  assert.equal(retry.broadcastId, 'bc_once');
+  assert.equal(calls.filter((call) => call.url === 'https://api.resend.com/broadcasts').length, 1, 'only one Resend draft');
+});
+
+test('the same key with different content is refused (409) without touching Resend', async () => {
+  const db = adminDb();
+  await onRequestPost({
+    request: draftRequest({ subject: 's', message: 'first' }, { cookie: 'htv_session=tok', key: DRAFT_KEY }),
+    env: { HTV_DB: db, ...RESEND_ENV },
+    fetch: mockFetch(segmentsThenCreate('bc_first')),
+  });
+  const calls = [];
   const response = await onRequestPost({
-    request: quickEmailRequest({ subject: 's', message: 'm' }, { cookie: 'htv_session=tok' }),
-    env: { HTV_DB: adminDb() },
+    request: draftRequest({ subject: 's', message: 'edited' }, { cookie: 'htv_session=tok', key: DRAFT_KEY }),
+    env: { HTV_DB: db, ...RESEND_ENV },
+    fetch: mockFetch([], calls),
+  });
+  assert.equal(response.status, 409);
+  assert.equal(calls.length, 0);
+});
+
+test('a failed Resend create releases the key so the same request can be retried cleanly', async () => {
+  const db = adminDb();
+  const request = () => draftRequest({ subject: 's', message: 'm' }, { cookie: 'htv_session=tok', key: DRAFT_KEY });
+  const failed = await onRequestPost({
+    request: request(),
+    env: { HTV_DB: db, ...RESEND_ENV },
+    fetch: mockFetch([{ status: 200, body: { data: [{ id: 'seg_general', name: 'General' }] } }, { status: 500, body: { message: 'down' } }]),
+  });
+  assert.equal(failed.status, 502);
+  assert.equal(db.receipts.size, 0, 'reservation released');
+  const retry = await onRequestPost({ request: request(), env: { HTV_DB: db, ...RESEND_ENV }, fetch: mockFetch(segmentsThenCreate('bc_retry')) });
+  assert.equal(retry.status, 200);
+  assert.equal((await retry.json()).broadcastId, 'bc_retry');
+});
+
+test('a draft still being created is not created twice (409 while pending)', async () => {
+  const db = adminDb();
+  const draft = new MessageDraft({ subject: 's', message: 'm' });
+  db.receipts.set(`usr_admin::${DRAFT_KEY}`, { fingerprint: await draft.fingerprint(), status: 'pending' });
+  const calls = [];
+  await assert.rejects(
+    createResendDraft(db, draft, { actorUserId: 'usr_admin', key: DRAFT_KEY, env: RESEND_ENV, fetcher: mockFetch([], calls) }),
+    (error) => error.status === 409 && /still being created/.test(error.message),
+  );
+  assert.equal(calls.length, 0);
+});
+
+test('creating a draft needs a signed-in admin and a valid Idempotency-Key', async () => {
+  const draft = new MessageDraft({ subject: 's', message: 'm' });
+  await assert.rejects(createResendDraft(adminDb(), draft, { actorUserId: null, key: DRAFT_KEY, env: RESEND_ENV }), (error) => error.status === 403);
+  const missing = await onRequestPost({
+    request: draftRequest({ subject: 's', message: 'm' }, { cookie: 'htv_session=tok' }),
+    env: { HTV_DB: adminDb(), ...RESEND_ENV },
+    fetch: mockFetch([]),
+  });
+  assert.equal(missing.status, 400);
+  assert.match((await missing.json()).error, /Idempotency-Key/);
+});
+
+test('message draft handler returns 503 when Resend is not configured, and releases the key', async () => {
+  const db = adminDb();
+  const response = await onRequestPost({
+    request: draftRequest({ subject: 's', message: 'm' }, { cookie: 'htv_session=tok', key: DRAFT_KEY }),
+    env: { HTV_DB: db },
     fetch: mockFetch([]),
   });
   assert.equal(response.status, 503);
+  assert.equal(db.receipts.size, 0);
 });
 
-test('quick email route only accepts POST', async () => {
+test('message draft route only accepts POST', async () => {
   const response = await onRequest();
   assert.equal(response.status, 405);
 });
@@ -444,24 +572,28 @@ test('quick email route only accepts POST', async () => {
 // --- admin UI --------------------------------------------------------------
 
 const adminHtml = () => readFileSync(new URL('../public/admin.html', import.meta.url), 'utf8');
-const composerJs = () => readFileSync(new URL('../public/admin-quick-email.js', import.meta.url), 'utf8');
+const composerJs = () => readFileSync(new URL('../public/admin-message-draft.js', import.meta.url), 'utf8');
+const editorJs = () => readFileSync(new URL('../public/admin-message-editor.js', import.meta.url), 'utf8');
+// The composer's pure helpers live in two modules: the shared editor and the email composer.
+const composer = { ...messageEditor, ...messageDraftComposer };
 
-test('admin page exposes a draft-only quick email composer', () => {
+test('admin page exposes a draft-only message draft composer', () => {
   const html = adminHtml();
-  const start = html.indexOf('id="quick-email"');
+  const start = html.indexOf('id="message-draft"');
   const section = html.slice(start, html.indexOf('</section>', start));
-  assert.ok(start > 0, 'missing quick email section');
-  assert.match(section, /data-admin-section="blog"/);
+  assert.ok(start > 0, 'missing message draft section');
+  assert.match(section, /data-admin-section="email"/);
   assert.match(section, /Email draft/);
-  assert.match(section, /id="quick-email-start"[^>]*>\s*<option value="">Blank message<\/option>/);
-  assert.match(section, /id="quick-email-editor" contenteditable="true"/);
+  assert.match(section, /id="message-draft-start"[^>]*>\s*<option value="">Blank message<\/option>/);
+  assert.match(section, /id="message-draft-editor" contenteditable="true"/);
   assert.doesNotMatch(section, /<textarea/);
-  assert.match(section, /id="quick-email-create-draft"/);
-  assert.match(html, /"quick-email": "blog"/);
-  assert.match(html, /<script type="module" src="\/admin-quick-email\.js"><\/script>/);
+  assert.match(section, /id="message-draft-create-draft"/);
+  assert.match(html, /"message-draft": "email"/);
+  assert.match(html, /<script type="module" src="\/admin-message-draft\.js"><\/script>/);
   const js = composerJs();
-  assert.match(js, /postJson\('\/api\/admin\/quick-email'/);
+  assert.match(js, /postJson\('\/api\/admin\/message-drafts'/);
   assert.match(js, /Nothing will be sent or scheduled from HTV admin/);
+  assert.match(js, /'Idempotency-Key': key/);
   for (const source of [section, js]) {
     assert.doesNotMatch(source, /Send now|Schedule send|scheduledAt|sendNow/);
   }
@@ -469,15 +601,15 @@ test('admin page exposes a draft-only quick email composer', () => {
 
 test('admin insert buttons are draggable chips for the Resend fields', () => {
   const html = adminHtml();
-  const buttons = [...html.matchAll(/<button type="button" draggable="true" data-quick-email-insert="([^"]+)"[^>]*class="qe-chip">([^<]+)<\/button>/g)]
+  const buttons = [...html.matchAll(/<button type="button" draggable="true" data-message-field="([^"]+)"[^>]*class="msg-chip">([^<]+)<\/button>/g)]
     .map((match) => ({ label: match[2], token: match[1] }));
-  assert.deepEqual(buttons, QUICK_EMAIL_FIELDS.map(({ label, token }) => ({ label, token })));
-  assert.match(html, /id="quick-email-image-file" type="file" accept="image\/png,image\/jpeg,image\/gif,image\/webp"/);
-  assert.match(composerJs(), /fetch\('\/api\/admin\/quick-email\/images'/);
-  assert.doesNotMatch(html + composerJs(), /FIRST_NAME/, 'use Resend contact.* fields, not legacy FIRST_NAME');
+  assert.deepEqual(buttons, MESSAGE_FIELDS.map(({ label, token }) => ({ label, token })));
+  assert.match(html, /id="message-draft-image-file" type="file" accept="image\/png,image\/jpeg,image\/gif,image\/webp"/);
+  assert.match(editorJs(), /fetch\('\/api\/admin\/message-drafts\/images'/);
+  assert.doesNotMatch(html + composerJs() + editorJs(), /FIRST_NAME/, 'use Resend contact.* fields, not legacy FIRST_NAME');
 });
 
-// --- admin composer (public/admin-quick-email.js) --------------------------
+// --- admin composer (public/admin-message-draft.js) ------------------------
 
 const textNode = (value) => ({ nodeType: 3, nodeName: '#text', nodeValue: value });
 // Like a browser NodeList: iterable with length/item(), but no array methods.
@@ -491,8 +623,8 @@ const imageBlock = (src, alt, width) => element('FIGURE', {
 });
 
 test('composer constants match the server renderer', () => {
-  assert.deepEqual(composer.QUICK_EMAIL_FIELDS, QUICK_EMAIL_FIELDS);
-  assert.deepEqual(composer.IMAGE_WIDTH, EMAIL_IMAGE_WIDTH);
+  assert.deepEqual(composer.MESSAGE_FIELDS, MESSAGE_FIELDS);
+  assert.deepEqual(composer.IMAGE_WIDTH, MESSAGE_IMAGE_WIDTH);
   for (const size of composer.IMAGE_SIZES) {
     assert.equal(composer.clampImageWidth(size.width), size.width, size.label);
   }
@@ -500,13 +632,13 @@ test('composer constants match the server renderer', () => {
 
 test('serializeEditor turns chips, line breaks, and image blocks into the message format', () => {
   const root = element('DIV', { children: [
-    textNode('Hi '), fieldChip('{{{contact.first_name|there}}}', 'First name'), textNode('​,'), lineBreak(), lineBreak(),
-    textNode('Flyer:'), imageBlock(`/api/email-images/${IMAGE_NAME}`, 'Hack Hours flyer', 360), textNode('​See you there'),
+    textNode('Hi '), fieldChip('{{{contact.first_name|there}}}', 'First name'), textNode('\u200B,'), lineBreak(), lineBreak(),
+    textNode('Flyer:'), imageBlock(`/api/email-images/${IMAGE_NAME}`, 'Hack Hours flyer', 360), textNode('\u200BSee\u00A0you there'),
   ] });
   const message = composer.serializeEditor(root);
   assert.equal(message, `Hi {{{contact.first_name|there}}},\n\nFlyer:\n![Hack Hours flyer](/api/email-images/${IMAGE_NAME}){width=360}\nSee you there`);
   // Round trip: the server renders the serialized message as intended.
-  const html = quickEmailBodyHtml(message);
+  const html = messageBodyHtml(message);
   assert.match(html, /<p>Hi \{\{\{contact\.first_name\|there\}\}\},<\/p>/);
   assert.match(html, new RegExp(`<img src="/api/email-images/${IMAGE_NAME}" alt="Hack Hours flyer" width="360">`));
   assert.match(html, /<p>See you there<\/p>/);
@@ -520,7 +652,7 @@ test('serializeEditor treats block elements as lines and collapses extra blank l
     element('DIV', { children: [textNode('- bullet')] }),
   ] });
   assert.equal(composer.serializeEditor(root), 'Line one\n\n- bullet');
-  assert.equal(composer.serializeEditor(element('DIV', { children: [textNode('​'), lineBreak()] })), '');
+  assert.equal(composer.serializeEditor(element('DIV', { children: [textNode('\u200B'), lineBreak()] })), '');
 });
 
 test('imageLine sanitizes the description and clamps the width', () => {
@@ -559,6 +691,11 @@ test('htmlToMessage converts a blog post body into the editable message format',
     '## Try it out',
     '- [Chrome Web Store](https://chromewebstore.google.com/x)\n- Not a link',
   ].join('\n\n'));
+});
+
+test('htmlToMessage keeps image widths from posts published in admin', () => {
+  const img = { ...element('IMG'), getAttribute: (name) => ({ src: '/api/email-images/img_0123456789abcdef.png', alt: 'Shot', width: '360' })[name] ?? null };
+  assert.equal(composer.htmlToMessage(element('DIV', { children: [element('P', { children: [img] })] })), '![Shot](/api/email-images/img_0123456789abcdef.png){width=360}');
 });
 
 test('messageBlocks and inlineParts rebuild editor content from message text', () => {

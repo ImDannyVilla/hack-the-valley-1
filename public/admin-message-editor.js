@@ -1,16 +1,17 @@
-// Email composer for the admin Email section (public/admin.html).
+// Message editor shared by the admin email composer (admin-message-draft.js)
+// and the blog editor (admin-blog-posts.js).
 //
 // The message box is a contenteditable editor: personalization fields show as
-// chips, uploaded images as resizable previews, and posts loaded with "Start
-// from" keep their headings, links, and bold text. Before preview or draft
-// creation the editor is serialized back to the plain-text message format
-// that POST /api/admin/quick-email renders (functions/_shared/quick-email.js),
-// so the server never sees editor HTML.
+// chips, uploaded images as resizable previews, and loaded posts keep their
+// headings, links, and bold text. The editor is serialized back to the
+// plain-text message format the server renders
+// (functions/_shared/message-format.js), so the server never sees editor HTML.
 //
-// Pure helpers are exported for tests; the DOM wiring only runs in a browser.
+// Pure helpers are exported for tests; createMessageEditor only runs in a
+// browser.
 
-// Kept in sync with functions/_shared/quick-email.js by tests.
-export const QUICK_EMAIL_FIELDS = Object.freeze([
+// Kept in sync with functions/_shared/message-format.js by tests.
+export const MESSAGE_FIELDS = Object.freeze([
   { label: 'First name', token: '{{{contact.first_name|there}}}' },
   { label: 'Last name', token: '{{{contact.last_name}}}' },
   { label: 'Email', token: '{{{contact.email}}}' },
@@ -21,22 +22,16 @@ export const IMAGE_SIZES = Object.freeze([
   { label: 'Medium', width: 360 },
   { label: 'Full', width: 552 },
 ]);
-// The preview shows the email as this contact would see it; the real email
-// keeps the tokens for Resend to fill in.
-export const PREVIEW_CONTACT = Object.freeze({ first_name: 'Alex', last_name: 'Rivera', email: 'alex.rivera@example.com' });
-
-const MESSAGE_MAX = 10000;
 const UPLOAD_MAX_WIDTH = 1200;
 const UPLOAD_MAX_BYTES = 5 * 1024 * 1024;
 const FIELD_MIME = 'application/x-htv-field';
-const ZWSP = '​';
+const ZWSP = '\u200B';
 const HEADING_PREFIX = Object.freeze({ H1: '## ', H2: '## ', H3: '### ', H4: '### ' });
 const LINE_BLOCKS = new Set(['DIV', 'P', 'LI', 'UL', 'OL', 'BLOCKQUOTE', 'SECTION']);
 const SKIP = new Set(['SCRIPT', 'STYLE', 'TEMPLATE', 'HR']);
 const IMAGE_LINE = /^\s*!\[([^\]]*)\]\(([^)\s]+)\)(?:\{width=(\d{1,4})\})?\s*$/;
 const HEADING_LINE = /^\s*(#{2,3})\s+(.+)$/;
 const INLINE = /(\{\{\{[^{}]+\}\}\})|\[([^\]\n]+)\]\(((?:https?:\/\/|\/(?!\/))[^)\s]*)\)|\*\*([^*\n]+?)\*\*/g;
-const CONTACT_TOKEN = /\{\{\{contact\.([a-z_]+)(?:\|([^}]*))?\}\}\}/g;
 
 export function clampImageWidth(value) {
   const width = Math.round(Number(value));
@@ -91,7 +86,7 @@ export function serializeEditor(root) {
   const walk = (node) => {
     for (const child of children(node)) {
       if (child.nodeType === 3) {
-        out += String(child.nodeValue || '').replaceAll(ZWSP, '').replaceAll(' ', ' ');
+        out += String(child.nodeValue || '').replaceAll(ZWSP, '').replaceAll('\u00A0', ' ');
       } else if (child.nodeType !== 1) {
         continue;
       } else if (child.nodeName === 'BR') {
@@ -151,7 +146,8 @@ export function htmlToMessage(root) {
   const pushImages = (node) => {
     for (const img of images(node)) {
       const src = String(img.getAttribute?.('src') ?? img.src ?? '').trim();
-      if (isSafeUrl(src)) blocks.push(imageLine({ src, alt: img.getAttribute?.('alt') ?? img.alt }));
+      const width = Number(img.getAttribute?.('width') ?? img.width) || undefined;
+      if (isSafeUrl(src)) blocks.push(imageLine({ src, alt: img.getAttribute?.('alt') ?? img.alt, width }));
     }
   };
   const pushText = (text, prefix = '') => {
@@ -190,7 +186,7 @@ export function htmlToMessage(root) {
 
 // Message text -> inline parts (text, field, link, bold). Known field tokens
 // become field parts; unknown {{{...}}} tokens stay text.
-export function inlineParts(text, fields = QUICK_EMAIL_FIELDS) {
+export function inlineParts(text, fields = MESSAGE_FIELDS) {
   const byToken = new Map(fields.map((field) => [field.token, field]));
   const source = String(text || '');
   const parts = [];
@@ -221,7 +217,7 @@ export function inlineParts(text, fields = QUICK_EMAIL_FIELDS) {
 
 // Message text -> editor blocks: images, headings, lines (with inline parts),
 // and blank lines. The browser turns these into editor nodes.
-export function messageBlocks(text, fields = QUICK_EMAIL_FIELDS) {
+export function messageBlocks(text, fields = MESSAGE_FIELDS) {
   return String(text || '').replace(/\r\n?/g, '\n').split('\n').map((line) => {
     const image = line.match(IMAGE_LINE);
     if (image && isSafeUrl(image[2])) {
@@ -234,33 +230,10 @@ export function messageBlocks(text, fields = QUICK_EMAIL_FIELDS) {
   });
 }
 
-function escapeHtml(value) {
-  return String(value ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
-
-// Preview only: fill contact fields with a sample contact so the preview reads
-// like a real inbox. Unknown fields fall back to the token's fallback text.
-export function previewWithSampleContact(html, contact = PREVIEW_CONTACT) {
-  return String(html || '').replace(CONTACT_TOKEN, (token, field, fallback = '') => escapeHtml(contact[field] ?? fallback));
-}
-
-async function readJson(response) {
+export async function readJson(response) {
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
   return data;
-}
-
-async function postJson(path, body) {
-  return readJson(await fetch(path, {
-    method: 'POST',
-    credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-    body: JSON.stringify(body),
-  }));
 }
 
 function canvasBlob(canvas, type) {
@@ -289,20 +262,16 @@ async function emailReadyImage(file) {
   return { blob, width: canvas.width };
 }
 
-function initQuickEmail() {
-  const $ = (id) => document.getElementById(id);
-  const editor = $('quick-email-editor');
-  const status = $('quick-email-status');
-  const startSelect = $('quick-email-start');
-  const postNote = $('quick-email-post-note');
-  const fields = new Map(QUICK_EMAIL_FIELDS.map((field) => [field.token, field]));
-  let savedRange = null;
-  let postSlug = '';
+// --- the editor ---------------------------------------------------------------
 
-  const setStatus = (message, error = false) => {
-    status.className = `text-sm ${error ? 'text-red-300' : 'text-slate-300'}`;
-    status.textContent = message;
-  };
+// Wire a contenteditable element as a message editor and return its message
+// API. Field chips are optional: the blog editor passes allowFields: false,
+// because personalized fields only work in emails.
+export function createMessageEditor({ editor, fieldButtons = [], imageButton = null, imageInput = null, setStatus = () => {}, allowFields = true } = {}) {
+  const fieldList = allowFields ? MESSAGE_FIELDS : [];
+  const fields = new Map(fieldList.map((field) => [field.token, field]));
+  let savedRange = null;
+
   const message = () => serializeEditor(editor);
   const refreshEmpty = () => {
     editor.dataset.empty = String(!message());
@@ -354,7 +323,7 @@ function initQuickEmail() {
 
   const fieldChip = (field) => {
     const chip = document.createElement('span');
-    chip.className = 'qe-chip';
+    chip.className = 'msg-chip';
     chip.contentEditable = 'false';
     chip.dataset.token = field.token;
     chip.title = `${field.label}: filled in for each contact`;
@@ -380,7 +349,7 @@ function initQuickEmail() {
 
   const imageBlock = ({ src, alt, width }) => {
     const figure = document.createElement('figure');
-    figure.className = 'qe-image';
+    figure.className = 'msg-image';
     figure.contentEditable = 'false';
     figure.dataset.imageSrc = src;
     figure.dataset.imageAlt = alt;
@@ -389,7 +358,7 @@ function initQuickEmail() {
     img.alt = alt;
     img.draggable = false;
     const tools = document.createElement('div');
-    tools.className = 'qe-image-tools';
+    tools.className = 'msg-image-tools';
     tools.innerHTML = `${IMAGE_SIZES.map((size) => `<button type="button" data-image-size="${size.width}">${size.label}</button>`).join('')}
       <input type="range" data-image-width min="${IMAGE_WIDTH.min}" max="${IMAGE_WIDTH.max}" step="4" aria-label="Image width">
       <span data-image-width-label></span>
@@ -417,10 +386,10 @@ function initQuickEmail() {
     return document.createTextNode(part.value);
   });
 
-  // Message text -> editor nodes (used for pasting and for "Start from").
+  // Message text -> editor nodes (used for pasting and for loading content).
   const nodesFromMessage = (text) => {
     const nodes = [];
-    for (const block of messageBlocks(text)) {
+    for (const block of messageBlocks(text, fieldList)) {
       if (block.type === 'image') {
         nodes.push(imageBlock(block));
       } else if (block.type === 'heading') {
@@ -437,6 +406,12 @@ function initQuickEmail() {
     return nodes;
   };
 
+  const setMessage = (text) => {
+    editor.replaceChildren(...nodesFromMessage(text));
+    savedRange = null;
+    refreshEmpty();
+  };
+
   const uploadImage = async (file, range) => {
     if (!file?.type?.startsWith('image/')) {
       setStatus('Choose an image file.', true);
@@ -446,7 +421,7 @@ function initQuickEmail() {
     setStatus('Uploading image…');
     try {
       const image = await emailReadyImage(file);
-      const data = await readJson(await fetch('/api/admin/quick-email/images', {
+      const data = await readJson(await fetch('/api/admin/message-drafts/images', {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': image.blob.type, 'X-Filename': encodeURIComponent(file.name || 'image') },
@@ -475,83 +450,25 @@ function initQuickEmail() {
     return range && editor.contains(range.startContainer) ? range : null;
   };
 
-  // --- Start from: blank or a published blog post ---------------------------
+  // --- Insert bar --------------------------------------------------------------
 
-  const setPost = (slug, title = '') => {
-    postSlug = slug;
-    postNote.classList.toggle('hidden', !slug);
-    postNote.textContent = slug ? `Started from “${title}”. The email ends with a link to read the post on the web.` : '';
-  };
-
-  const loadPostList = async () => {
-    try {
-      const response = await fetch('/blog/posts.json', { headers: { Accept: 'application/json' } });
-      const data = response.ok ? await response.json() : { posts: [] };
-      const posts = Array.isArray(data.posts) ? data.posts : [];
-      if (!posts.length) return;
-      const group = document.createElement('optgroup');
-      group.label = 'Blog posts';
-      for (const post of posts) {
-        const option = document.createElement('option');
-        option.value = post.slug;
-        option.textContent = post.title || post.slug;
-        group.append(option);
-      }
-      startSelect.append(group);
-    } catch {
-      // Blank messages still work without the post list.
-    }
-  };
-
-  startSelect.addEventListener('change', async () => {
-    const slug = startSelect.value;
-    if (message() && !window.confirm('Replace the current message?')) {
-      startSelect.value = postSlug;
-      return;
-    }
-    if (!slug) {
-      editor.replaceChildren();
-      setPost('');
-      refreshEmpty();
-      setStatus('Started a blank message.');
-      return;
-    }
-    setStatus('Loading post…');
-    try {
-      const data = await readJson(await fetch(`/api/admin/quick-email/post?slug=${encodeURIComponent(slug)}`, { credentials: 'same-origin' }));
-      const doc = new DOMParser().parseFromString(data.html, 'text/html');
-      editor.replaceChildren(...nodesFromMessage(htmlToMessage(doc.body)));
-      savedRange = null;
-      if (!$('quick-email-subject').value.trim()) $('quick-email-subject').value = data.title || '';
-      $('quick-email-heading').value = data.title || '';
-      setPost(data.slug, data.title || data.slug);
-      refreshEmpty();
-      setStatus('Post loaded. Edit anything below, then preview.');
-    } catch (error) {
-      startSelect.value = postSlug;
-      setStatus(error.message, true);
-    }
-  });
-
-  // --- Insert bar ------------------------------------------------------------
-
-  document.querySelectorAll('[data-quick-email-insert]').forEach((button) => {
-    const token = button.dataset.quickEmailInsert;
+  for (const button of allowFields ? fieldButtons : []) {
+    const token = button.dataset.messageField;
     button.addEventListener('click', () => insertField(token));
     button.addEventListener('dragstart', (event) => {
       event.dataTransfer.setData(FIELD_MIME, token);
       event.dataTransfer.setData('text/plain', token);
       event.dataTransfer.effectAllowed = 'copy';
     });
-  });
-  $('quick-email-image-button').addEventListener('click', () => $('quick-email-image-file').click());
-  $('quick-email-image-file').addEventListener('change', (event) => {
+  }
+  imageButton?.addEventListener('click', () => imageInput?.click());
+  imageInput?.addEventListener('change', (event) => {
     const file = event.target.files?.[0];
     event.target.value = '';
     if (file) uploadImage(file);
   });
 
-  // --- Editor behavior -------------------------------------------------------
+  // --- Editor behavior ---------------------------------------------------------
 
   // Enter adds a line break (<br>) rather than a nested <div>. In a heading,
   // the new line starts after the heading instead of inside it.
@@ -571,9 +488,9 @@ function initQuickEmail() {
     document.execCommand('insertLineBreak');
   });
 
-  // Paste as plain text (tokens become chips), or upload a pasted image.
+  // Paste as plain text (known tokens become chips), or upload a pasted image.
   editor.addEventListener('paste', (event) => {
-    if (event.target.closest?.('.qe-image')) return;
+    if (event.target.closest?.('.msg-image')) return;
     event.preventDefault();
     const image = [...(event.clipboardData?.files || [])].find((file) => file.type.startsWith('image/'));
     if (image) uploadImage(image);
@@ -583,20 +500,20 @@ function initQuickEmail() {
   // Drop a field button or an image file where it should go.
   const droppable = (event) => {
     const types = [...(event.dataTransfer?.types || [])];
-    return types.includes(FIELD_MIME) || types.includes('Files');
+    return (allowFields && types.includes(FIELD_MIME)) || types.includes('Files');
   };
   editor.addEventListener('dragover', (event) => {
     if (!droppable(event)) return;
     event.preventDefault();
     event.dataTransfer.dropEffect = 'copy';
-    editor.classList.add('qe-drop-target');
+    editor.classList.add('msg-drop-target');
   });
   editor.addEventListener('dragleave', (event) => {
-    if (!editor.contains(event.relatedTarget)) editor.classList.remove('qe-drop-target');
+    if (!editor.contains(event.relatedTarget)) editor.classList.remove('msg-drop-target');
   });
   editor.addEventListener('drop', (event) => {
-    editor.classList.remove('qe-drop-target');
-    const token = event.dataTransfer?.getData(FIELD_MIME);
+    editor.classList.remove('msg-drop-target');
+    const token = allowFields ? event.dataTransfer?.getData(FIELD_MIME) : '';
     const file = [...(event.dataTransfer?.files || [])].find((item) => item.type.startsWith('image/'));
     if (!token && !file) return;
     event.preventDefault();
@@ -607,14 +524,14 @@ function initQuickEmail() {
 
   // Image tools: size presets, width slider, description, remove.
   editor.addEventListener('input', (event) => {
-    const figure = event.target.closest?.('.qe-image');
+    const figure = event.target.closest?.('.msg-image');
     if (figure && event.target.matches('[data-image-width]')) applyImageWidth(figure, event.target.value);
     if (figure && event.target.matches('[data-image-alt]')) figure.dataset.imageAlt = event.target.value;
     refreshEmpty();
   });
   editor.addEventListener('click', (event) => {
     const button = event.target.closest?.('button');
-    const figure = button?.closest('.qe-image');
+    const figure = button?.closest('.msg-image');
     if (!figure || !editor.contains(figure)) return;
     if (button.dataset.imageSize) applyImageWidth(figure, button.dataset.imageSize);
     if (button.hasAttribute('data-image-remove')) {
@@ -624,59 +541,17 @@ function initQuickEmail() {
     }
   });
 
-  // --- Preview and draft -----------------------------------------------------
-
-  const payload = (extra = {}) => ({
-    subject: $('quick-email-subject').value.trim(),
-    heading: $('quick-email-heading').value.trim(),
-    message: message(),
-    ...(postSlug ? { postSlug } : {}),
-    ...extra,
-  });
-  const tooLong = () => {
-    if (message().length <= MESSAGE_MAX) return false;
-    setStatus(`The message is too long (limit ${MESSAGE_MAX} characters).`, true);
-    return true;
-  };
-
-  $('quick-email-preview').addEventListener('click', async () => {
-    if (tooLong()) return;
-    setStatus('Rendering preview…');
-    try {
-      const data = await postJson('/api/admin/quick-email', payload({ dryRun: true }));
-      $('quick-email-preview-frame').srcdoc = previewWithSampleContact(data.html);
-      const { first_name: first, last_name: last, email } = PREVIEW_CONTACT;
-      setStatus(`Preview ready — subject: "${data.subject}". Shown as ${first} ${last} (${email}) would see it; each contact gets their own details. Nothing has been sent.`);
-    } catch (error) {
-      setStatus(error.message, true);
-    }
-  });
-
-  $('quick-email-create-draft').addEventListener('click', async () => {
-    const subject = $('quick-email-subject').value.trim();
-    if (!subject) {
-      setStatus('Add a subject line first.', true);
-      return;
-    }
-    if (tooLong()) return;
-    if (!window.confirm(`Create a Resend draft for "${subject}"? Nothing will be sent or scheduled from HTV admin.`)) return;
-
-    const button = $('quick-email-create-draft');
-    button.disabled = true;
-    setStatus('Creating Resend draft…');
-    try {
-      const data = await postJson('/api/admin/quick-email', payload());
-      const segment = data.segmentName || data.segmentId || 'placeholder segment';
-      setStatus(`Draft created for "${data.subject}". Resend broadcast ${data.broadcastId}. Recipient placeholder: ${segment}. Review/change recipients in Resend before sending.`);
-    } catch (error) {
-      setStatus(error.message, true);
-    } finally {
-      button.disabled = false;
-    }
-  });
-
   refreshEmpty();
-  loadPostList();
-}
 
-if (typeof document !== 'undefined' && document.getElementById('quick-email-editor')) initQuickEmail();
+  return {
+    message,
+    setMessage,
+    // Load published post HTML (as returned by the server) for editing.
+    setHtml(html) {
+      setMessage(htmlToMessage(new DOMParser().parseFromString(String(html || ''), 'text/html').body));
+    },
+    clear() {
+      setMessage('');
+    },
+  };
+}

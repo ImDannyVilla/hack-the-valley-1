@@ -1,18 +1,13 @@
-// Broadcast drafts: the one home for turning a rendered HTV email (a quick
-// email, optionally started from a blog post) into a Resend draft broadcast.
+// Resend broadcasts adapter: the only code that talks to Resend's Broadcast
+// API. It creates draft broadcasts and never calls Resend's send or schedule
+// endpoints; organizers review recipients and send from Resend. Callers (the
+// MessageDraft domain object) hand it an already-rendered email.
 //
-// HTV admin is draft-only: it creates the broadcast and never calls Resend's
-// send/schedule endpoints. Organizers review recipients and send from Resend.
-// Routes call into here; they never talk to Resend directly. Pure presentation
-// helpers (building the email HTML) live in functions/_shared/blog-broadcast.js
-// and functions/_shared/quick-email.js — those are not domain concerns.
-//
-// History: blog blasts used to be scheduled and sent from here and logged in
-// the blog_broadcast_sends table (migration 0025), with a daily cron
-// reconciling those rows against Resend. Nothing has written to that table
-// since drafts became the only path, so the scheduling, send-log, and
-// reconcile code was removed. The table and its rows are left in place as
-// history; dropping them would be a separate, approved migration.
+// History: blog blasts used to be scheduled and sent through here and logged
+// in the blog_broadcast_sends table (migration 0025), with a daily cron
+// reconciling those rows against Resend. That path was removed once admin
+// became draft-only. The table and its rows are left in place as history;
+// dropping them would be a separate, approved migration.
 
 export const DRAFT_STATUS = 'draft';
 

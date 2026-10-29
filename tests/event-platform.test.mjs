@@ -821,11 +821,11 @@ test("admin page lists event instances as flat rows without dropdowns", () => {
 
 test("admin page has one draft-only email composer that can start from a blog post", () => {
   const html = readFileSync(new URL("../public/admin.html", import.meta.url), "utf8");
-  const composer = readFileSync(new URL("../public/admin-quick-email.js", import.meta.url), "utf8");
+  const composer = readFileSync(new URL("../public/admin-message-draft.js", import.meta.url), "utf8");
   assert.doesNotMatch(html, /id="blog-blast"|Blog email draft|blogBlastPayload|Past sends/);
-  assert.match(html, /id="quick-email-start"/);
+  assert.match(html, /id="message-draft-start"/);
   assert.match(html, /Create Resend draft/);
-  assert.match(composer, /\/api\/admin\/quick-email\/post\?slug=/);
+  assert.match(composer, /\/api\/admin\/message-drafts\/blog-post\?slug=/);
   assert.match(composer, /Nothing will be sent or scheduled from HTV admin/);
   for (const source of [html, composer]) {
     assert.doesNotMatch(source, /createDraft: true/);

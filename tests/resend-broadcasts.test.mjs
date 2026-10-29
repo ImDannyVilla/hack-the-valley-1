@@ -1,3 +1,5 @@
+// Email template, the Resend draft adapter, loading blog posts for message
+// drafts, and the blog post file contract.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, existsSync, readdirSync } from 'node:fs';
@@ -5,16 +7,16 @@ import { fileURLToPath } from 'node:url';
 
 import {
   absolutizeUrls,
-  buildBroadcastEmailHtml,
-} from '../functions/_shared/blog-broadcast.js';
+  buildEmailHtml,
+} from '../functions/_shared/email-template.js';
 import { BlogPost } from '../functions/_lib/domain/blog-post.js';
 import {
   createBroadcast,
   createDraftEmail,
   resolveBroadcastConfig,
   resolveDraftSegmentId,
-} from '../functions/_lib/domain/blog-broadcast.js';
-import { onRequestGet as getPost, onRequest as postRouteFallback } from '../functions/api/admin/quick-email/post.js';
+} from '../functions/_shared/resend-broadcasts.js';
+import { onRequestGet as getPost, onRequest as postRouteFallback } from '../functions/api/admin/message-drafts/blog-post.js';
 
 // --- helpers ---------------------------------------------------------------
 
@@ -58,6 +60,7 @@ function adminDb({ role = 'admin' } = {}) {
           if (/FROM roles/.test(sql)) {
             return role && this.args.includes(role) ? { role, scope_type: 'global', scope_id: '*', created_at: '2026-01-01T00:00:00.000Z' } : null;
           }
+          if (/FROM blog_posts/.test(sql)) return null;
           throw new Error(`Unexpected first() query: ${sql}`);
         },
         async run() { throw new Error(`Unexpected run() query: ${sql}`); },
@@ -85,7 +88,7 @@ function assets(files = { '/blog/posts.json': MANIFEST, '/blog/test-post': POST_
 function postRequest(slug, { cookie } = {}) {
   const headers = {};
   if (cookie) headers.cookie = cookie;
-  return new Request(`https://hackthevalley.org/api/admin/quick-email/post?slug=${encodeURIComponent(slug)}`, { headers });
+  return new Request(`https://hackthevalley.org/api/admin/message-drafts/blog-post?slug=${encodeURIComponent(slug)}`, { headers });
 }
 
 // --- pure helpers + Resend draft path --------------------------------------
@@ -108,8 +111,8 @@ test('absolutizeUrls rewrites root-relative URLs and leaves absolute ones', () =
   assert.match(out, /src="\/\/cdn\/y"/);
 });
 
-test('buildBroadcastEmailHtml includes title, upcoming-events CTA, submission CTA, and unsubscribe token', () => {
-  const html = buildBroadcastEmailHtml({
+test('buildEmailHtml includes title, upcoming-events CTA, submission CTA, and unsubscribe token', () => {
+  const html = buildEmailHtml({
     title: 'My Post',
     contentHtml: '<p>body</p>',
     postUrl: 'https://hackthevalley.org/blog/my-post',
@@ -123,8 +126,8 @@ test('buildBroadcastEmailHtml includes title, upcoming-events CTA, submission CT
   assert.match(html, /\{\{\{RESEND_UNSUBSCRIBE_URL\}\}\}/);
 });
 
-test('buildBroadcastEmailHtml constrains image width inline so screenshots do not overflow', () => {
-  const html = buildBroadcastEmailHtml({
+test('buildEmailHtml constrains image width inline so screenshots do not overflow', () => {
+  const html = buildEmailHtml({
     title: 'P',
     contentHtml: '<figure><img src="https://h.org/images/big.png" alt="x"><figcaption>cap</figcaption></figure>',
   });
@@ -229,7 +232,7 @@ test('createDraftEmail returns 409 when no safe draft placeholder segment exists
   assert.equal(calls[0].url, 'https://api.resend.com/segments?limit=100');
 });
 
-// --- "Start from a blog post": GET /api/admin/quick-email/post --------------
+// --- "Start from a blog post": GET /api/admin/message-drafts/blog-post -------
 
 test('post route rejects non-admins with 401', async () => {
   const response = await getPost({ request: postRequest('test-post'), env: { HTV_DB: {}, ASSETS: assets() } });
@@ -288,7 +291,7 @@ const publicDir = fileURLToPath(new URL('../public/', import.meta.url));
 
 test('blog list page loads posts and renders newest first', () => {
   const html = readFileSync(`${publicDir}blog/index.html`, 'utf8');
-  assert.match(html, /fetch\("\/blog\/posts\.json"/);
+  assert.match(html, /fetch\("\/api\/blog\/posts"/);
   assert.match(html, /String\(b\.date \|\| ""\)\.localeCompare\(String\(a\.date \|\| ""\)\)/);
   assert.match(html, /href="\/blog\/\$\{encodeURIComponent\(post\.slug\)\}"/);
 });

@@ -1,4 +1,7 @@
 import { switchAdminAccount } from './admin-session.js';
+import { createMutationKeyStore } from './admin-idempotency.js';
+
+export { createMutationKeyStore };
 
 const API = '/api/admin/sponsorships';
 const STATUSES = {
@@ -24,18 +27,6 @@ export function parseMoney(value) {
   return result;
 }
 
-export function createMutationKeyStore(makeKey = () => crypto.randomUUID()) {
-  const pending = new Map();
-  const identity = (method, path, payload) => JSON.stringify([method, path, payload]);
-  return {
-    key(method, path, payload) {
-      const name = identity(method, path, payload);
-      if (!pending.has(name)) pending.set(name, makeKey());
-      return pending.get(name);
-    },
-    complete(method, path, payload) { pending.delete(identity(method, path, payload)); },
-  };
-}
 
 // A save includes the visible UI transition, not just the successful HTTP write.
 // Keep an acknowledged result until refresh/detail rendering also succeeds.
