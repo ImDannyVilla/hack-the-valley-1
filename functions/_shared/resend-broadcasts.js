@@ -1,7 +1,12 @@
 // Resend broadcasts adapter: the only code that talks to Resend's Broadcast
 // API. It creates draft broadcasts and never calls Resend's send or schedule
-// endpoints; organizers review recipients and send from Resend. Callers (the
+// endpoints; organizers review a draft and send it from Resend. Callers (the
 // MessageDraft domain object) hand it an already-rendered email.
+//
+// Drafts are addressed to HTV's updates audience, the Resend segment in
+// RESEND_ALL_CONTACTS_SEGMENT_ID (General). Its contacts are real recipients,
+// so there is no fallback to another segment, and fetchDraftAudience gives its
+// name and current size for the admin to check before creating a draft.
 //
 // History: blog blasts used to be scheduled and sent through here and logged
 // in the blog_broadcast_sends table (migration 0025), with a daily cron
@@ -10,6 +15,10 @@
 // dropping them would be a separate, approved migration.
 
 export const DRAFT_STATUS = 'draft';
+
+// How long a create waits for Resend. Giving up leaves the outcome unknown
+// (Resend may still create the draft), so it is never treated as a refusal.
+export const CREATE_TIMEOUT_MS = 15000;
 
 function httpError(message, status, extra) {
   return Object.assign(new Error(message), { status }, extra || {});
@@ -23,10 +32,10 @@ async function readResponseText(response) {
   }
 }
 
-// Resolve the broadcast settings from env. Throws a 503 (not configured) if a
+// Resolve the draft settings from env. Throws a 503 (not configured) if a
 // required value is missing, matching how the mailing-list sync behaves.
-// Broadcasts carry a reply-to address because the email template asks
-// recipients to reply with projects/stories to feature on the blog.
+// Drafts carry a reply-to address because the email template asks recipients
+// to reply with projects/stories to feature on the blog.
 export function resolveBroadcastConfig(env = {}) {
   const apiKey = String(env.RESEND_API_KEY || '').trim();
   // RESEND_BROADCAST_FROM only — no fallback to RESEND_FROM/RESEND_FROM_EMAIL. Those are the
@@ -35,28 +44,31 @@ export function resolveBroadcastConfig(env = {}) {
   // this function exists to enforce (see htv-issue-100).
   const from = String(env.RESEND_BROADCAST_FROM || '').trim();
   const replyTo = String(env.RESEND_BROADCAST_REPLY_TO || env.RESEND_REPLY_TO || env.HTV_CONTACT_EMAIL || 'contact@hackthevalley.org').trim();
+  // The audience every draft is addressed to. No name-based guess: a guessed
+  // segment could be the wrong list of real people.
+  const segmentId = String(env.RESEND_ALL_CONTACTS_SEGMENT_ID || '').trim();
   const missing = [];
   if (!apiKey) missing.push('RESEND_API_KEY');
   if (!from) missing.push('RESEND_BROADCAST_FROM');
+  if (!segmentId) missing.push('RESEND_ALL_CONTACTS_SEGMENT_ID');
   if (missing.length) {
-    throw httpError(`Email blasts are not configured. Missing: ${missing.join(', ')}.`, 503);
+    throw httpError(`Email drafts are not configured. Missing: ${missing.join(', ')}.`, 503);
   }
-  return { apiKey, from, replyTo };
+  return { apiKey, from, replyTo, segmentId };
 }
 
-function isDraftPlaceholderSegment(segment) {
-  const name = String(segment?.name || '').trim().toLowerCase();
-  const id = String(segment?.id || '').trim().toLowerCase();
-  return ['general', 'draft', 'drafts', 'preview', 'test'].includes(name) || ['general', 'draft', 'drafts', 'preview', 'test'].includes(id);
-}
-
+// Every item in a Resend list. The first request sets no limit, which makes
+// Resend return the whole list at once (one request against its rate limit);
+// pages are followed only if it still reports more.
 async function fetchResendList({ apiKey, fetcher, path }) {
   const items = [];
   let after = '';
   for (let page = 0; page < 50; page += 1) {
     const url = new URL(path, 'https://api.resend.com');
-    url.searchParams.set('limit', '100');
-    if (after) url.searchParams.set('after', after);
+    if (after) {
+      url.searchParams.set('limit', '100');
+      url.searchParams.set('after', after);
+    }
     const response = await fetcher(url.toString(), {
       headers: { Authorization: `Bearer ${apiKey}` },
     });
@@ -73,79 +85,75 @@ async function fetchResendList({ apiKey, fetcher, path }) {
   return items;
 }
 
-// Resend's API requires segment_id even when creating a draft. For draft-only
-// workflows, do NOT verify or create an all-contacts segment. Use an explicitly
-// configured safe placeholder, or auto-pick an existing placeholder-like segment
-// such as "General". The operator must review/change recipients inside Resend
-// before sending.
-export async function resolveDraftSegmentId({ env = {}, fetcher = fetch } = {}) {
-  const apiKey = String(env.RESEND_API_KEY || '').trim();
-  const explicit = String(
-    env.RESEND_BROADCAST_DRAFT_SEGMENT_ID ||
-      env.RESEND_DRAFT_SEGMENT_ID ||
-      ''
-  ).trim();
-  if (explicit) {
-    return { segmentId: explicit, segmentName: null, source: 'configured' };
+// Who a new draft is addressed to: the configured segment's name, how many
+// contacts it has now, and how many of them are subscribed (a sent broadcast
+// skips the unsubscribed ones). Read-only.
+export async function fetchDraftAudience({ env = {}, fetcher = fetch } = {}) {
+  const { apiKey, segmentId } = resolveBroadcastConfig(env);
+  const path = `/segments/${encodeURIComponent(segmentId)}`;
+  const response = await fetcher(`https://api.resend.com${path}`, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  });
+  if (response.status === 404) {
+    throw httpError(`RESEND_ALL_CONTACTS_SEGMENT_ID names a segment that Resend doesn't have (${segmentId}).`, 503);
   }
-
-  const segments = await fetchResendList({ apiKey, fetcher, path: '/segments' });
-  const candidates = segments.filter((segment) => segment?.id && isDraftPlaceholderSegment(segment));
-  if (candidates.length === 1) {
-    return { segmentId: candidates[0].id, segmentName: candidates[0].name || null, source: 'auto-discovered-placeholder' };
+  if (!response.ok) {
+    throw httpError(`Could not load the Resend segment (HTTP ${response.status}).`, 502);
   }
-
-  const names = segments.map((segment) => segment.name || segment.id).filter(Boolean).join(', ') || 'none';
-  throw httpError(
-    `Resend requires segment_id even to create a draft broadcast. Set RESEND_BROADCAST_DRAFT_SEGMENT_ID to an existing safe placeholder segment. Available segments: ${names}.`,
-    409,
-  );
+  const segment = await response.json().catch(() => ({}));
+  const contacts = await fetchResendList({ apiKey, fetcher, path: `${path}/contacts` });
+  return {
+    segmentId,
+    name: String(segment?.name || '').trim() || segmentId,
+    contactCount: contacts.length,
+    subscribedCount: contacts.filter((contact) => !contact?.unsubscribed).length,
+  };
 }
 
-// Create a Resend broadcast (a draft targeting the segment) and return its id.
-export async function createBroadcast({ env = {}, fetcher = fetch, audienceId, from, replyTo, subject, name, html } = {}) {
-  const apiKey = String(env.RESEND_API_KEY || '').trim();
-  const body = { segment_id: audienceId, from, subject, name, html };
-  if (replyTo) body.reply_to = [replyTo];
-  const response = await fetcher('https://api.resend.com/broadcasts', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+// Create a draft broadcast to the configured audience and return its id. A
+// failure says whether the draft may exist anyway:
+//   created: false  Resend answered 4xx: it refused, so nothing was created;
+//   created: null   no answer (network error or timeout), a 5xx, or a success
+//                   without an id: Resend may have created it.
+// Only the first is safe to retry without checking Resend.
+export async function createBroadcast({ config, fetcher = fetch, subject, name, html, timeoutMs = CREATE_TIMEOUT_MS } = {}) {
+  const body = { segment_id: config.segmentId, from: config.from, subject, name, html };
+  if (config.replyTo) body.reply_to = [config.replyTo];
+  let response;
+  try {
+    response = await fetcher('https://api.resend.com/broadcasts', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${config.apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (error) {
+    throw httpError(`Resend did not answer (${error?.message || error}).`, 502, { created: null });
+  }
   if (!response.ok) {
-    throw httpError(`Resend broadcast create failed with HTTP ${response.status}: ${await readResponseText(response)}`, 502);
+    throw httpError(`Resend broadcast create failed with HTTP ${response.status}: ${await readResponseText(response)}`, 502, {
+      created: response.status < 500 ? false : null,
+    });
   }
   const created = await response.json().catch(() => ({}));
   const broadcastId = created?.id || created?.data?.id;
   if (!broadcastId) {
-    throw httpError('Resend broadcast create returned no id.', 502);
+    throw httpError('Resend accepted the draft but returned no id.', 502, { created: null });
   }
   return broadcastId;
 }
 
-// Create a Resend draft of an already-rendered email. This intentionally does
-// not call /send, because no mail has been accepted for delivery.
-export async function createDraftEmail({ subject, name, html, env = {}, fetcher = fetch } = {}) {
-  const { from, replyTo } = resolveBroadcastConfig(env);
-  const draftSegment = await resolveDraftSegmentId({ env, fetcher });
-  const broadcastId = await createBroadcast({
-    env,
-    fetcher,
-    audienceId: draftSegment.segmentId,
-    from,
-    replyTo,
-    subject,
-    name,
-    html,
-  });
+// The broadcast whose name contains `marker`, or null. Callers put a unique
+// reference in each draft's name, so a create whose outcome is unknown can be
+// looked up afterwards.
+export async function findBroadcast({ config, fetcher = fetch, marker } = {}) {
+  const broadcasts = await fetchResendList({ apiKey: config.apiKey, fetcher, path: '/broadcasts' });
+  const match = broadcasts.find((broadcast) => broadcast?.id && String(broadcast.name || '').includes(marker));
+  if (!match) return null;
   return {
-    broadcastId,
-    status: DRAFT_STATUS,
-    scheduled: false,
-    segmentId: draftSegment.segmentId,
-    segmentName: draftSegment.segmentName,
-    segmentSource: draftSegment.source,
-    needsRecipientReview: true,
-    warning: 'Created a Resend draft only. No send or schedule call was made; review/change recipients in Resend before sending.',
+    broadcastId: match.id,
+    name: match.name,
+    segmentId: match.segment_id || match.audience_id || null,
+    status: match.status || null,
   };
 }

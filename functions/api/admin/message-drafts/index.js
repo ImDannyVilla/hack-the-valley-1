@@ -12,11 +12,11 @@ function baseUrl(request, env) {
   return String(env.SITE_BASE_URL || new URL(request.url).origin).replace(/\/+$/, '');
 }
 
-// POST /api/admin/message-drafts  { subject, heading?, message, postSlug?, dryRun? }
+// POST /api/admin/message-drafts  { subject, heading?, message, postSlug?, segmentId, dryRun? }
 // Admin-only. dryRun returns the rendered email for preview. Otherwise creates
-// a Resend draft, at most once per Idempotency-Key header. There is
-// deliberately no send/schedule mode: recipients are reviewed and the send
-// happens in Resend.
+// a Resend draft, at most once per Idempotency-Key header, for the audience
+// the admin was shown (segmentId, from GET /api/admin/message-drafts/audience).
+// There is deliberately no send/schedule mode: the send happens in Resend.
 export async function onRequestPost(context) {
   return handleErrors(async () => {
     const { user } = await requireAdmin(context.request, context.env);
@@ -33,6 +33,7 @@ export async function onRequestPost(context) {
     const result = await createResendDraft(getDb(env), draft, {
       actorUserId: user?.id,
       key: request.headers.get('Idempotency-Key'),
+      segmentId: String(input.segmentId || '').trim(),
       baseUrl: base,
       env,
       fetcher: context.fetch || fetch,

@@ -12,11 +12,12 @@ import {
 import { BlogPost } from '../functions/_lib/domain/blog-post.js';
 import {
   createBroadcast,
-  createDraftEmail,
+  fetchDraftAudience,
+  findBroadcast,
   resolveBroadcastConfig,
-  resolveDraftSegmentId,
 } from '../functions/_shared/resend-broadcasts.js';
 import { onRequestGet as getPost, onRequest as postRouteFallback } from '../functions/api/admin/message-drafts/blog-post.js';
+import { createFakeResend } from './helpers/fake-resend.mjs';
 
 // --- helpers ---------------------------------------------------------------
 
@@ -136,15 +137,31 @@ test('buildEmailHtml constrains image width inline so screenshots do not overflo
   assert.match(html, /<figcaption style="[^"]*text-align:center/);
 });
 
-test('resolveBroadcastConfig requires an API key and sender', () => {
+const SEGMENT = { RESEND_ALL_CONTACTS_SEGMENT_ID: 'seg_general' };
+const CONFIG = { apiKey: 'k', from: 'HTV <a@b.co>', replyTo: 'contact@hackthevalley.org', segmentId: 'seg_general' };
+
+test('resolveBroadcastConfig requires an API key, sender, and the all-contacts segment', () => {
   assert.throws(() => resolveBroadcastConfig({}), (err) => {
-    return err.status === 503 && /RESEND_API_KEY/.test(err.message) && /RESEND_BROADCAST_FROM/.test(err.message);
+    return err.status === 503 && /RESEND_API_KEY/.test(err.message) && /RESEND_BROADCAST_FROM/.test(err.message) && /RESEND_ALL_CONTACTS_SEGMENT_ID/.test(err.message);
   });
-  const config = resolveBroadcastConfig({ RESEND_API_KEY: 'k', RESEND_BROADCAST_FROM: 'HTV <a@b.co>' });
+  const config = resolveBroadcastConfig({ RESEND_API_KEY: 'k', RESEND_BROADCAST_FROM: 'HTV <a@b.co>', ...SEGMENT });
   assert.equal(config.from, 'HTV <a@b.co>');
   assert.equal(config.replyTo, 'contact@hackthevalley.org');
-  const custom = resolveBroadcastConfig({ RESEND_API_KEY: 'k', RESEND_BROADCAST_FROM: 'HTV <a@b.co>', RESEND_BROADCAST_REPLY_TO: 'blog@hackthevalley.org' });
+  assert.equal(config.segmentId, 'seg_general');
+  const custom = resolveBroadcastConfig({ RESEND_API_KEY: 'k', RESEND_BROADCAST_FROM: 'HTV <a@b.co>', RESEND_BROADCAST_REPLY_TO: 'blog@hackthevalley.org', ...SEGMENT });
   assert.equal(custom.replyTo, 'blog@hackthevalley.org');
+});
+
+test('drafts never pick a segment by name: only RESEND_ALL_CONTACTS_SEGMENT_ID is used', () => {
+  // The old draft placeholder settings (and a segment that happens to be named
+  // General) are not a fallback: General has real recipients.
+  for (const env of [{ RESEND_BROADCAST_DRAFT_SEGMENT_ID: 'seg_general' }, { RESEND_DRAFT_SEGMENT_ID: 'seg_general' }, {}]) {
+    assert.throws(() => resolveBroadcastConfig({ RESEND_API_KEY: 'k', RESEND_BROADCAST_FROM: 'HTV <a@b.co>', ...env }), (err) => {
+      return err.status === 503 && /Missing: RESEND_ALL_CONTACTS_SEGMENT_ID/.test(err.message);
+    });
+  }
+  const code = readFileSync(new URL('../functions/_shared/resend-broadcasts.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(code, /placeholder|DRAFT_SEGMENT_ID|'general'/i);
 });
 
 test('resolveBroadcastConfig does not fall back to RESEND_FROM / RESEND_FROM_EMAIL (htv-issue-100)', () => {
@@ -164,72 +181,62 @@ test('resolveBroadcastConfig does not fall back to RESEND_FROM / RESEND_FROM_EMA
   // value, not either legacy one, confirming there's no silent cross-contamination either way.
   const config = resolveBroadcastConfig({
     RESEND_API_KEY: 'k', RESEND_BROADCAST_FROM: 'HTV <a@b.co>',
-    RESEND_FROM: 'legacy@b.co', RESEND_FROM_EMAIL: 'also-legacy@b.co',
+    RESEND_FROM: 'legacy@b.co', RESEND_FROM_EMAIL: 'also-legacy@b.co', ...SEGMENT,
   });
   assert.equal(config.from, 'HTV <a@b.co>');
 });
 
-test('resolveDraftSegmentId uses an existing safe placeholder and does not inspect contacts', async () => {
+test('fetchDraftAudience counts the segment in one request and follows pages if Resend reports more', async () => {
   const calls = [];
   const fetcher = mockFetch([
-    { status: 200, body: { data: [{ id: 'seg_event', name: 'Hack the Valley 2026' }, { id: 'seg_general', name: 'General' }] } },
+    { status: 200, body: { object: 'segment', id: 'seg_general', name: 'General' } },
+    { status: 200, body: { has_more: true, data: [{ id: 'c1' }, { id: 'c2', unsubscribed: true }] } },
+    { status: 200, body: { has_more: false, data: [{ id: 'c3', unsubscribed: false }] } },
   ], calls);
-  const draft = await resolveDraftSegmentId({ env: { RESEND_API_KEY: 'k' }, fetcher });
-  assert.deepEqual(draft, { segmentId: 'seg_general', segmentName: 'General', source: 'auto-discovered-placeholder' });
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].url, 'https://api.resend.com/segments?limit=100');
+  const audience = await fetchDraftAudience({ env: { RESEND_API_KEY: 'k', RESEND_BROADCAST_FROM: 'f', ...SEGMENT }, fetcher });
+  assert.deepEqual(audience, { segmentId: 'seg_general', name: 'General', contactCount: 3, subscribedCount: 2 });
+  assert.deepEqual(calls.map((call) => call.url), [
+    'https://api.resend.com/segments/seg_general',
+    'https://api.resend.com/segments/seg_general/contacts',
+    'https://api.resend.com/segments/seg_general/contacts?limit=100&after=c2',
+  ]);
 });
 
-test('resolveDraftSegmentId refuses to auto-pick an unsafe populated-looking segment', async () => {
-  const calls = [];
-  const fetcher = mockFetch([
-    { status: 200, body: { data: [{ id: 'seg_htv_2026', name: 'Hack the Valley 2026' }], has_more: false } },
-  ], calls);
-
-  await assert.rejects(
-    resolveDraftSegmentId({ env: { RESEND_API_KEY: 'rk_test' }, fetcher }),
-    /safe placeholder segment/,
-  );
-});
-
-test('createBroadcast posts the Resend segment/from and returns the id', async () => {
+test('createBroadcast posts the configured segment, sender, and reply-to, and returns the id', async () => {
   const calls = [];
   const fetcher = mockFetch([{ status: 200, body: { id: 'bc_123' } }], calls);
-  const id = await createBroadcast({
-    env: { RESEND_API_KEY: 'k' }, fetcher,
-    audienceId: 'aud_1', from: 'HTV <a@b.co>', replyTo: 'contact@hackthevalley.org', subject: 'Hi', name: 'Blog: x', html: '<p>e</p>',
-  });
+  const id = await createBroadcast({ config: CONFIG, fetcher, subject: 'Hi', name: 'Blog: x', html: '<p>e</p>' });
   assert.equal(id, 'bc_123');
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, 'https://api.resend.com/broadcasts');
   const createBody = JSON.parse(calls[0].init.body);
-  assert.equal(createBody.segment_id, 'aud_1');
+  assert.equal(createBody.segment_id, 'seg_general');
   assert.equal(createBody.from, 'HTV <a@b.co>');
   assert.deepEqual(createBody.reply_to, ['contact@hackthevalley.org']);
+  assert.ok(calls[0].init.signal, 'the create has a timeout');
 });
 
-test('createBroadcast throws 502 if create fails', async () => {
-  const fetcher = mockFetch([{ status: 400, body: { message: 'bad' } }]);
-  await assert.rejects(
-    createBroadcast({ env: { RESEND_API_KEY: 'k' }, fetcher, audienceId: 'a', from: 'f', subject: 's', html: 'h' }),
-    (err) => err.status === 502,
-  );
+test('createBroadcast says whether a failed create may still have made the draft', async () => {
+  const attempt = (fetcher) => createBroadcast({ config: CONFIG, fetcher, subject: 's', name: 'n', html: 'h' }).then(() => assert.fail('expected a failure'), (error) => error);
+  for (const status of [400, 401, 422, 429]) {
+    const error = await attempt(mockFetch([{ status, body: { message: 'refused' } }]));
+    assert.equal(error.status, 502);
+    assert.equal(error.created, false, `HTTP ${status} is a definite refusal`);
+  }
+  for (const status of [500, 503]) {
+    assert.equal((await attempt(mockFetch([{ status, body: {} }]))).created, null, `HTTP ${status} may have created it`);
+  }
+  assert.equal((await attempt(async () => { throw new TypeError('fetch failed'); })).created, null, 'no answer');
+  assert.equal((await attempt(mockFetch([{ status: 200, body: {} }]))).created, null, 'accepted without an id');
 });
 
-test('createDraftEmail returns 409 when no safe draft placeholder segment exists', async () => {
-  const calls = [];
-  await assert.rejects(
-    createDraftEmail({
-      subject: 's', name: 'n', html: '<p>e</p>',
-      env: { RESEND_API_KEY: 'k', RESEND_BROADCAST_FROM: 'HTV <a@b.co>' },
-      fetcher: mockFetch([
-        { status: 200, body: { data: [{ id: 'seg_event', name: 'Hack the Valley 2026' }, { id: 'seg_alumni', name: 'Alumni' }] } },
-      ], calls),
-    }),
-    (error) => error.status === 409 && /requires segment_id even to create a draft/.test(error.message),
-  );
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].url, 'https://api.resend.com/segments?limit=100');
+test('findBroadcast finds a draft by the reference in its name', async () => {
+  const resend = createFakeResend();
+  await createBroadcast({ config: CONFIG, fetcher: resend.fetch, subject: 's', name: 'Email: s · ref 0123456789ab', html: 'h' });
+  assert.deepEqual(await findBroadcast({ config: CONFIG, fetcher: resend.fetch, marker: 'ref 0123456789ab' }), {
+    broadcastId: 'bc_1', name: 'Email: s · ref 0123456789ab', segmentId: 'seg_general', status: 'draft',
+  });
+  assert.equal(await findBroadcast({ config: CONFIG, fetcher: resend.fetch, marker: 'ref ffffffffffff' }), null);
 });
 
 // --- "Start from a blog post": GET /api/admin/message-drafts/blog-post -------

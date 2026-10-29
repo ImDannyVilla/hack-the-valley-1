@@ -7,14 +7,17 @@ import { MESSAGE_FIELDS, MESSAGE_IMAGE_WIDTH, messageBodyHtml } from '../functio
 import {
   MESSAGE_IMAGE_MAX_BYTES,
   MessageDraft,
+  PENDING_SETTLE_AFTER_MS,
   createResendDraft,
   messageImageKey,
   prepareMessageImage,
 } from '../functions/_lib/domain/message-draft.js';
-import { createDraftEmail } from '../functions/_shared/resend-broadcasts.js';
 import * as messageEditor from '../public/admin-message-editor.js';
 import * as messageDraftComposer from '../public/admin-message-draft.js';
 import { onRequestPost, onRequest } from '../functions/api/admin/message-drafts/index.js';
+import { onRequestGet as getAudience } from '../functions/api/admin/message-drafts/audience.js';
+import { createSponsorshipDb, DEMO_USERS } from './helpers/sponsorship-db.mjs';
+import { createFakeResend } from './helpers/fake-resend.mjs';
 import { onRequestPost as uploadImage } from '../functions/api/admin/message-drafts/images.js';
 import { onRequestGet as getImage } from '../functions/api/email-images/[name].js';
 
@@ -89,12 +92,13 @@ function draftRequest(body, { cookie, key } = {}) {
 }
 
 const DRAFT_KEY = 'draft-key-0001';
-const segmentsThenCreate = (id) => [
-  { status: 200, body: { data: [{ id: 'seg_general', name: 'General' }] } },
-  { status: 200, body: { id } },
-];
+const created = (id) => [{ status: 200, body: { id } }];
 
-const RESEND_ENV = { RESEND_API_KEY: 'k', RESEND_BROADCAST_FROM: 'HTV <a@b.co>' };
+// Drafts go to the configured all-contacts segment, and a create names the
+// segment the admin was shown.
+const AUDIENCE = 'seg_general';
+const RESEND_ENV = { RESEND_API_KEY: 'k', RESEND_BROADCAST_FROM: 'HTV <a@b.co>', RESEND_ALL_CONTACTS_SEGMENT_ID: AUDIENCE };
+const REF_NAME = (base) => new RegExp(`^${base} · ref [a-f0-9]{12}$`);
 
 const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
 const IMAGE_NAME = 'img_0123456789abcdef.png';
@@ -323,24 +327,6 @@ test('messageBodyHtml returns an empty string for an empty message', () => {
   assert.equal(messageBodyHtml('  \n\n '), '');
 });
 
-// --- domain ----------------------------------------------------------------
-
-test('createDraftEmail creates a Resend draft without a post slug and never calls send', async () => {
-  const calls = [];
-  const result = await createDraftEmail({
-    subject: 's', name: 'Email: s', html: '<p>e</p>',
-    env: RESEND_ENV,
-    fetcher: mockFetch([
-      { status: 200, body: { data: [{ id: 'seg_general', name: 'General' }] } },
-      { status: 200, body: { id: 'bc_quick' } },
-    ], calls),
-  });
-  assert.equal(result.broadcastId, 'bc_quick');
-  assert.equal(result.status, 'draft');
-  assert.equal('slug' in result, false);
-  assert.ok(!calls.some((call) => String(call.url).includes('/send')));
-});
-
 // --- route -----------------------------------------------------------------
 
 test('worker routes /api/admin/message-drafts and rejects non-admins with 401', async () => {
@@ -424,15 +410,12 @@ test('an email started from a blog post links back to the post and is named afte
 
   const calls = [];
   const draft = await onRequestPost({
-    request: draftRequest({ subject: 's', message: 'm', postSlug: 'spotlight' }, { cookie: 'htv_session=tok', key: DRAFT_KEY }),
+    request: draftRequest({ subject: 's', message: 'm', postSlug: 'spotlight', segmentId: AUDIENCE }, { cookie: 'htv_session=tok', key: DRAFT_KEY }),
     env: { HTV_DB: adminDb(), ASSETS: POST_ASSETS, ...RESEND_ENV },
-    fetch: mockFetch([
-      { status: 200, body: { data: [{ id: 'seg_general', name: 'General' }] } },
-      { status: 200, body: { id: 'bc_post' } },
-    ], calls),
+    fetch: mockFetch(created('bc_post'), calls),
   });
   assert.equal(draft.status, 200);
-  assert.equal(JSON.parse(calls[1].init.body).name, 'Blog: Project Spotlight');
+  assert.match(JSON.parse(calls[0].init.body).name, REF_NAME('Blog: Project Spotlight'));
 });
 
 test('an email for an unknown blog post is refused before anything reaches Resend', async () => {
@@ -459,35 +442,50 @@ test('message draft heading overrides the email title but not the subject', asyn
 test('message draft handler creates a Resend draft for an admin and never calls send', async () => {
   const calls = [];
   const response = await onRequestPost({
-    request: draftRequest({ subject: 'Hack Hours is back', message: 'See you Saturday.' }, { cookie: 'htv_session=tok', key: DRAFT_KEY }),
+    request: draftRequest({ subject: 'Hack Hours is back', message: 'See you Saturday.', segmentId: AUDIENCE }, { cookie: 'htv_session=tok', key: DRAFT_KEY }),
     env: { HTV_DB: adminDb(), ...RESEND_ENV },
-    fetch: mockFetch(segmentsThenCreate('bc_quick'), calls),
+    fetch: mockFetch(created('bc_quick'), calls),
   });
   assert.equal(response.status, 200);
   const body = await response.json();
   assert.equal(body.ok, true);
   assert.equal(body.broadcastId, 'bc_quick');
   assert.equal(body.status, 'draft');
-  assert.equal(body.scheduled, false);
+  assert.equal(body.segmentId, AUDIENCE);
   assert.equal(body.replayed, false);
-  assert.equal(body.needsRecipientReview, true);
-  assert.equal(calls.length, 2);
-  assert.equal(calls[1].url, 'https://api.resend.com/broadcasts');
+  assert.equal(calls.length, 1, 'the configured segment is used as is, never looked up by name');
+  assert.equal(calls[0].url, 'https://api.resend.com/broadcasts');
   assert.ok(!calls.some((call) => String(call.url).includes('/send')), 'drafts must never call Resend /send');
-  const createBody = JSON.parse(calls[1].init.body);
+  const createBody = JSON.parse(calls[0].init.body);
+  assert.equal(createBody.segment_id, AUDIENCE);
   assert.equal(createBody.subject, 'Hack Hours is back');
-  assert.equal(createBody.name, 'Email: Hack Hours is back');
+  assert.match(createBody.name, REF_NAME('Email: Hack Hours is back'));
+  assert.equal(body.name, createBody.name);
   assert.match(createBody.html, /See you Saturday\./);
   assert.deepEqual(createBody.reply_to, ['contact@hackthevalley.org']);
+});
+
+test('a draft is only created for the audience the admin was shown', async () => {
+  for (const segmentId of ['seg_old', undefined]) {
+    const calls = [];
+    const response = await onRequestPost({
+      request: draftRequest({ subject: 's', message: 'm', segmentId }, { cookie: 'htv_session=tok', key: DRAFT_KEY }),
+      env: { HTV_DB: adminDb(), ...RESEND_ENV },
+      fetch: mockFetch(created('bc_x'), calls),
+    });
+    assert.equal(response.status, 409, String(segmentId));
+    assert.match((await response.json()).error, segmentId ? /audience changed/ : /Load the email audience first/);
+    assert.equal(calls.length, 0);
+  }
 });
 
 test('retrying a draft with the same key and content replays it instead of creating a duplicate', async () => {
   const db = adminDb();
   const calls = [];
   const send = () => onRequestPost({
-    request: draftRequest({ subject: 'Hack Hours is back', message: 'See you Saturday.' }, { cookie: 'htv_session=tok', key: DRAFT_KEY }),
+    request: draftRequest({ subject: 'Hack Hours is back', message: 'See you Saturday.', segmentId: AUDIENCE }, { cookie: 'htv_session=tok', key: DRAFT_KEY }),
     env: { HTV_DB: db, ...RESEND_ENV },
-    fetch: mockFetch(segmentsThenCreate('bc_once'), calls),
+    fetch: mockFetch(created('bc_once'), calls),
   }).then((response) => response.json());
   const first = await send();
   const retry = await send();
@@ -500,13 +498,13 @@ test('retrying a draft with the same key and content replays it instead of creat
 test('the same key with different content is refused (409) without touching Resend', async () => {
   const db = adminDb();
   await onRequestPost({
-    request: draftRequest({ subject: 's', message: 'first' }, { cookie: 'htv_session=tok', key: DRAFT_KEY }),
+    request: draftRequest({ subject: 's', message: 'first', segmentId: AUDIENCE }, { cookie: 'htv_session=tok', key: DRAFT_KEY }),
     env: { HTV_DB: db, ...RESEND_ENV },
-    fetch: mockFetch(segmentsThenCreate('bc_first')),
+    fetch: mockFetch(created('bc_first')),
   });
   const calls = [];
   const response = await onRequestPost({
-    request: draftRequest({ subject: 's', message: 'edited' }, { cookie: 'htv_session=tok', key: DRAFT_KEY }),
+    request: draftRequest({ subject: 's', message: 'edited', segmentId: AUDIENCE }, { cookie: 'htv_session=tok', key: DRAFT_KEY }),
     env: { HTV_DB: db, ...RESEND_ENV },
     fetch: mockFetch([], calls),
   });
@@ -514,17 +512,17 @@ test('the same key with different content is refused (409) without touching Rese
   assert.equal(calls.length, 0);
 });
 
-test('a failed Resend create releases the key so the same request can be retried cleanly', async () => {
+test('a create Resend refuses (4xx) releases the key so the same request can be retried cleanly', async () => {
   const db = adminDb();
-  const request = () => draftRequest({ subject: 's', message: 'm' }, { cookie: 'htv_session=tok', key: DRAFT_KEY });
+  const request = () => draftRequest({ subject: 's', message: 'm', segmentId: AUDIENCE }, { cookie: 'htv_session=tok', key: DRAFT_KEY });
   const failed = await onRequestPost({
     request: request(),
     env: { HTV_DB: db, ...RESEND_ENV },
-    fetch: mockFetch([{ status: 200, body: { data: [{ id: 'seg_general', name: 'General' }] } }, { status: 500, body: { message: 'down' } }]),
+    fetch: mockFetch([{ status: 422, body: { message: 'Invalid `from` field.' } }]),
   });
   assert.equal(failed.status, 502);
   assert.equal(db.receipts.size, 0, 'reservation released');
-  const retry = await onRequestPost({ request: request(), env: { HTV_DB: db, ...RESEND_ENV }, fetch: mockFetch(segmentsThenCreate('bc_retry')) });
+  const retry = await onRequestPost({ request: request(), env: { HTV_DB: db, ...RESEND_ENV }, fetch: mockFetch(created('bc_retry')) });
   assert.equal(retry.status, 200);
   assert.equal((await retry.json()).broadcastId, 'bc_retry');
 });
@@ -532,13 +530,13 @@ test('a failed Resend create releases the key so the same request can be retried
 test('a draft still being created is not created twice (409 while pending)', async () => {
   const db = adminDb();
   const draft = new MessageDraft({ subject: 's', message: 'm' });
-  db.receipts.set(`usr_admin::${DRAFT_KEY}`, { fingerprint: await draft.fingerprint(), status: 'pending' });
+  db.receipts.set(`usr_admin::${DRAFT_KEY}`, { fingerprint: await draft.fingerprint(), status: 'pending', created_at: new Date().toISOString() });
   const calls = [];
   await assert.rejects(
-    createResendDraft(db, draft, { actorUserId: 'usr_admin', key: DRAFT_KEY, env: RESEND_ENV, fetcher: mockFetch([], calls) }),
-    (error) => error.status === 409 && /still being created/.test(error.message),
+    createResendDraft(db, draft, { actorUserId: 'usr_admin', key: DRAFT_KEY, segmentId: AUDIENCE, env: RESEND_ENV, fetcher: mockFetch([], calls) }),
+    (error) => error.status === 409 && /still being confirmed/.test(error.message),
   );
-  assert.equal(calls.length, 0);
+  assert.deepEqual(calls.map((call) => call.init.method || 'GET'), ['GET'], 'only looked for it in Resend');
 });
 
 test('creating a draft needs a signed-in admin and a valid Idempotency-Key', async () => {
@@ -553,20 +551,112 @@ test('creating a draft needs a signed-in admin and a valid Idempotency-Key', asy
   assert.match((await missing.json()).error, /Idempotency-Key/);
 });
 
-test('message draft handler returns 503 when Resend is not configured, and releases the key', async () => {
+test('message draft handler returns 503 when Resend is not configured, and reserves nothing', async () => {
   const db = adminDb();
   const response = await onRequestPost({
-    request: draftRequest({ subject: 's', message: 'm' }, { cookie: 'htv_session=tok', key: DRAFT_KEY }),
-    env: { HTV_DB: db },
+    request: draftRequest({ subject: 's', message: 'm', segmentId: AUDIENCE }, { cookie: 'htv_session=tok', key: DRAFT_KEY }),
+    env: { HTV_DB: db, RESEND_API_KEY: 'k', RESEND_BROADCAST_FROM: 'HTV <a@b.co>' },
     fetch: mockFetch([]),
   });
   assert.equal(response.status, 503);
+  assert.match((await response.json()).error, /RESEND_ALL_CONTACTS_SEGMENT_ID/);
   assert.equal(db.receipts.size, 0);
 });
 
 test('message draft route only accepts POST', async () => {
   const response = await onRequest();
   assert.equal(response.status, 405);
+});
+
+// --- the audience: GET /api/admin/message-drafts/audience ----------------------
+
+const audienceRequest = ({ cookie } = {}) => new Request('https://hackthevalley.org/api/admin/message-drafts/audience', { headers: cookie ? { cookie } : {} });
+
+test('the audience route shows admins the configured segment and its current size', async () => {
+  const resend = createFakeResend({
+    contacts: [{ id: 'c1', unsubscribed: false }, { id: 'c2', unsubscribed: false }, { id: 'c3', unsubscribed: true }],
+  });
+  assert.equal((await getAudience({ request: audienceRequest(), env: { HTV_DB: {}, ...RESEND_ENV }, fetch: resend.fetch })).status, 401);
+  const response = await getAudience({ request: audienceRequest({ cookie: 'htv_session=tok' }), env: { HTV_DB: adminDb(), ...RESEND_ENV }, fetch: resend.fetch });
+  assert.equal(response.status, 200);
+  assert.deepEqual((await response.json()).audience, { segmentId: AUDIENCE, name: 'General', contactCount: 3, subscribedCount: 2 });
+  assert.deepEqual(resend.calls.map((call) => call.path), ['/segments/seg_general', '/segments/seg_general/contacts']);
+  assert.equal((await worker.fetch(audienceRequest(), { HTV_DB: {} })).status, 401, 'routed by the worker');
+});
+
+test('the audience route reports a missing or unknown segment instead of guessing one', async () => {
+  const notConfigured = await getAudience({ request: audienceRequest({ cookie: 'htv_session=tok' }), env: { HTV_DB: adminDb(), RESEND_API_KEY: 'k', RESEND_BROADCAST_FROM: 'HTV <a@b.co>' }, fetch: createFakeResend().fetch });
+  assert.equal(notConfigured.status, 503);
+  assert.match((await notConfigured.json()).error, /RESEND_ALL_CONTACTS_SEGMENT_ID/);
+  const unknown = await getAudience({ request: audienceRequest({ cookie: 'htv_session=tok' }), env: { HTV_DB: adminDb(), ...RESEND_ENV, RESEND_ALL_CONTACTS_SEGMENT_ID: 'seg_gone' }, fetch: createFakeResend().fetch });
+  assert.equal(unknown.status, 503);
+  assert.match((await unknown.json()).error, /seg_gone/);
+});
+
+// --- unknown outcomes, against a real message_draft_receipts table --------------
+
+async function receiptsDb(t) {
+  const { db, close } = await createSponsorshipDb();
+  t.after(close);
+  return db;
+}
+
+const ACTOR = DEMO_USERS.alex;
+const createDraft = (db, resend, { now } = {}) => createResendDraft(db, new MessageDraft({ subject: 'Hack Hours is back', message: 'See you Saturday.' }), {
+  actorUserId: ACTOR, key: DRAFT_KEY, segmentId: AUDIENCE, baseUrl: 'https://hackthevalley.org', env: RESEND_ENV, fetcher: resend.fetch, now,
+});
+const storedReceipt = (db) => db.prepare('SELECT status, broadcast_id FROM message_draft_receipts WHERE actor_user_id = ? AND idempotency_key = ?').bind(ACTOR, DRAFT_KEY).first();
+const createCalls = (resend) => resend.calls.filter((call) => call.method === 'POST').length;
+
+test('a lost success response keeps the key pending, and the retry finds the draft instead of making another', async (t) => {
+  const db = await receiptsDb(t);
+  const resend = createFakeResend();
+  resend.nextCreate = 'lose';
+  await assert.rejects(createDraft(db, resend), (error) => error.status === 502 && /didn't confirm the draft/.test(error.message));
+  assert.equal(resend.broadcasts.length, 1, 'Resend did create it');
+  assert.equal((await storedReceipt(db)).status, 'pending', 'the key is held, not released');
+
+  const retry = await createDraft(db, resend);
+  assert.equal(retry.replayed, true);
+  assert.equal(retry.broadcastId, resend.broadcasts[0].id);
+  assert.equal(createCalls(resend), 1, 'no second create');
+  assert.deepEqual(await storedReceipt(db), { status: 'created', broadcast_id: resend.broadcasts[0].id });
+});
+
+test('a draft whose id could not be recorded is found on retry, not created again', async (t) => {
+  const db = await receiptsDb(t);
+  const resend = createFakeResend();
+  await db.exec("CREATE TRIGGER fail_receipt BEFORE UPDATE ON message_draft_receipts WHEN NEW.status = 'created' BEGIN SELECT RAISE(ABORT, 'D1 unavailable'); END");
+  await assert.rejects(createDraft(db, resend), (error) => error.status === 500 && error.message.includes(resend.broadcasts[0].id));
+  assert.equal((await storedReceipt(db)).status, 'pending');
+  await db.exec('DROP TRIGGER fail_receipt');
+
+  const retry = await createDraft(db, resend);
+  assert.equal(retry.replayed, true);
+  assert.equal(retry.broadcastId, resend.broadcasts[0].id);
+  assert.equal(createCalls(resend), 1);
+  assert.equal((await storedReceipt(db)).status, 'created');
+});
+
+test('only a definite rejection releases the key; a 5xx stays pending until Resend shows no draft', async (t) => {
+  const db = await receiptsDb(t);
+  const resend = createFakeResend();
+  resend.nextCreate = 'reject';
+  await assert.rejects(createDraft(db, resend), (error) => error.status === 502 && /HTTP 422/.test(error.message));
+  assert.equal(await storedReceipt(db), null, 'a 4xx releases the key');
+
+  resend.nextCreate = 'down';
+  await assert.rejects(createDraft(db, resend), (error) => error.status === 502 && /didn't confirm the draft/.test(error.message));
+  assert.equal((await storedReceipt(db)).status, 'pending', 'a 5xx might still have created it');
+  await assert.rejects(createDraft(db, resend), (error) => error.status === 409 && /still being confirmed/.test(error.message));
+  assert.equal(createCalls(resend), 2, 'nothing new while it is unsettled');
+
+  const later = new Date(Date.now() + PENDING_SETTLE_AFTER_MS + 1000);
+  const settled = await createDraft(db, resend, { now: later });
+  assert.equal(settled.replayed, false, 'Resend has no draft for it, so it is created once');
+  assert.equal(createCalls(resend), 3);
+  assert.equal(resend.broadcasts.length, 1);
+  assert.equal((await storedReceipt(db)).broadcast_id, resend.broadcasts[0].id);
 });
 
 // --- admin UI --------------------------------------------------------------
@@ -588,15 +678,26 @@ test('admin page exposes a draft-only message draft composer', () => {
   assert.match(section, /id="message-draft-editor" contenteditable="true"/);
   assert.doesNotMatch(section, /<textarea/);
   assert.match(section, /id="message-draft-create-draft"/);
+  assert.match(section, /id="message-draft-audience"/);
+  assert.match(section, /id="message-draft-audience-refresh"/);
   assert.match(html, /"message-draft": "email"/);
   assert.match(html, /<script type="module" src="\/admin-message-draft\.js"><\/script>/);
   const js = composerJs();
   assert.match(js, /postJson\('\/api\/admin\/message-drafts'/);
+  assert.match(js, /fetch\('\/api\/admin\/message-drafts\/audience'/);
+  assert.match(js, /payload\(\{ segmentId: audience\.segmentId \}\)/, 'a create names the audience that was shown');
   assert.match(js, /Nothing will be sent or scheduled from HTV admin/);
   assert.match(js, /'Idempotency-Key': key/);
   for (const source of [section, js]) {
     assert.doesNotMatch(source, /Send now|Schedule send|scheduledAt|sendNow/);
+    assert.doesNotMatch(source, /placeholder segment|Recipient placeholder|change recipients/i, 'the audience is real, not a placeholder');
   }
+});
+
+test('the composer labels the audience with its size', () => {
+  assert.equal(composer.audienceLabel({ name: 'General', contactCount: 1204, subscribedCount: 1180 }), 'General: 1,204 contacts (1,180 subscribed)');
+  assert.equal(composer.audienceLabel({ name: 'General', contactCount: 3, subscribedCount: 3 }), 'General: 3 contacts');
+  assert.equal(composer.audienceLabel({ name: 'General', contactCount: 1, subscribedCount: 1 }), 'General: 1 contact');
 });
 
 test('admin insert buttons are draggable chips for the Resend fields', () => {

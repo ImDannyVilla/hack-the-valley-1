@@ -3,7 +3,8 @@
 // MessageDraft in docs/domain-model.md). It owns the draft's rules: a required
 // subject and message within limits, the optional blog post (a ContentItem) it
 // was started from and links back to, how it renders as an email, the images
-// it may carry, and how it becomes a Resend draft at most once per request.
+// it may carry, and how it becomes a Resend draft at most once per request,
+// addressed to the audience the admin was shown.
 //
 // Sending stays a human step in Resend: nothing here calls Resend's send or
 // schedule endpoints. Pure formatting lives in functions/_shared/message-format.js
@@ -12,7 +13,7 @@
 
 import { absolutizeUrls, buildEmailHtml } from '../../_shared/email-template.js';
 import { MESSAGE_LIMITS, messageBodyHtml } from '../../_shared/message-format.js';
-import { createDraftEmail } from '../../_shared/resend-broadcasts.js';
+import { DRAFT_STATUS, createBroadcast, findBroadcast, resolveBroadcastConfig } from '../../_shared/resend-broadcasts.js';
 import { loadBlogPost } from './blog-post.js';
 
 function draftError(message, status = 400) {
@@ -81,83 +82,149 @@ export class MessageDraft {
 
 // --- creating the Resend draft, once per request ----------------------------
 
-// The composer sends one Idempotency-Key per draft attempt (the same pattern
+// The composer sends one Idempotency-Key per draft content (the same pattern
 // as sponsorship writes); the same content keeps the same key.
 const REQUEST_KEY = /^[\w.:-]{8,150}$/;
 
+// How long a create with an unknown outcome stays pending before HTV may
+// conclude from Resend's broadcast list that it never happened. Far longer
+// than a create can run (CREATE_TIMEOUT_MS), so that attempt is over.
+export const PENDING_SETTLE_AFTER_MS = 5 * 60 * 1000;
+
 // Create the Resend draft for a MessageDraft at most once per (admin, key).
-// Creating a draft is an external side effect, so the key is reserved first
-// ('pending'), the draft is created, then the result is recorded ('created')
-// in message_draft_receipts (migration 0031). A retry with the same key and
-// content replays the recorded draft; the same key with different content is
-// refused. If Resend refuses the create, the reservation is released so a
-// clean retry is possible.
-export async function createResendDraft(db, draft, { actorUserId, key, baseUrl, env = {}, fetcher = fetch } = {}) {
+// Resend can't deduplicate broadcast creates, so the key is reserved
+// ('pending') in message_draft_receipts (migration 0031), the draft is created
+// with the reservation's reference in its name, and the result is recorded
+// ('created'). A retry with the same key and content replays the recorded
+// draft; the same key with different content is refused.
+//
+// Only a definite rejection from Resend (a 4xx) releases the key. Any other
+// failure (no answer, a 5xx, a lost response, or failing to record the
+// returned id) leaves it pending, and the next attempt settles it before
+// anything is created: a draft carrying the reference in Resend is recorded
+// and replayed; if there is none once PENDING_SETTLE_AFTER_MS has passed, the
+// key is released and the draft created.
+//
+// `segmentId` is the audience the admin was shown. It must still be the
+// configured one, so a draft never goes to a list the admin didn't check.
+export async function createResendDraft(db, draft, { actorUserId, key, segmentId, baseUrl, env = {}, fetcher = fetch, now = new Date() } = {}) {
   if (!actorUserId) throw draftError('A signed-in admin is required to create drafts.', 403);
   if (typeof key !== 'string' || !REQUEST_KEY.test(key)) throw draftError('A valid Idempotency-Key is required.');
-  const fingerprint = await draft.fingerprint();
+  const config = resolveBroadcastConfig(env);
+  const receipt = {
+    actorUserId,
+    key,
+    fingerprint: await draft.fingerprint(),
+    ref: `ref ${(await sha256Hex(`${actorUserId}\n${key}`)).slice(0, 12)}`,
+  };
 
-  const recorded = await recordedDraft(db, { actorUserId, key, fingerprint });
-  if (recorded) return recorded;
+  const settled = await settledDraft(db, receipt, { config, fetcher, now });
+  if (settled) return settled;
+  if (segmentId !== config.segmentId) {
+    throw draftError(segmentId
+      ? 'The email audience changed after this page loaded it. Refresh it, check who the draft goes to, then create it again.'
+      : 'Load the email audience first, so you can check who the draft goes to.', 409);
+  }
 
-  const reservedAt = new Date().toISOString();
+  const name = `${draft.broadcastName()} · ${receipt.ref}`;
+  const html = draft.toEmailHtml({ baseUrl });
+  const reservedAt = now.toISOString();
   try {
     await db
       .prepare(
         `INSERT INTO message_draft_receipts (actor_user_id, idempotency_key, fingerprint, status, created_at, updated_at)
          VALUES (?, ?, ?, 'pending', ?, ?)`
       )
-      .bind(actorUserId, key, fingerprint, reservedAt, reservedAt)
+      .bind(actorUserId, key, receipt.fingerprint, reservedAt, reservedAt)
       .run();
   } catch (error) {
     // A concurrent request with the same key reserved it first.
-    const concurrent = await recordedDraft(db, { actorUserId, key, fingerprint });
+    const concurrent = await settledDraft(db, receipt, { config, fetcher, now });
     if (concurrent) return concurrent;
     throw error;
   }
 
-  let result;
+  let broadcastId;
   try {
-    result = await createDraftEmail({
-      subject: draft.subject,
-      name: draft.broadcastName(),
-      html: draft.toEmailHtml({ baseUrl }),
-      env,
-      fetcher,
-    });
+    broadcastId = await createBroadcast({ config, fetcher, subject: draft.subject, name, html });
   } catch (error) {
-    await db
-      .prepare('DELETE FROM message_draft_receipts WHERE actor_user_id = ? AND idempotency_key = ?')
-      .bind(actorUserId, key)
-      .run();
-    throw error;
+    if (error.created === false) {
+      await releaseReceipt(db, receipt, reservedAt);
+      throw error;
+    }
+    throw draftError(
+      `Resend didn't confirm the draft (${error.message}). HTV is holding it so it can't be created twice: it may already be in Resend as "${name}". Trying again in a few minutes records it, or creates it if it isn't there.`,
+      502,
+    );
   }
 
-  await db
-    .prepare(
-      `UPDATE message_draft_receipts SET status = 'created', broadcast_id = ?, response_json = ?, updated_at = ?
-       WHERE actor_user_id = ? AND idempotency_key = ?`
-    )
-    .bind(result.broadcastId, JSON.stringify(result), new Date().toISOString(), actorUserId, key)
-    .run();
+  const result = { broadcastId, name, segmentId: config.segmentId, status: DRAFT_STATUS };
+  try {
+    await recordCreated(db, receipt, result, new Date());
+  } catch {
+    throw draftError(
+      `Resend created the draft "${name}" (broadcast ${broadcastId}), but HTV couldn't record it. It's in Resend, so don't create it again; trying again later records it.`,
+      500,
+    );
+  }
   return { ...result, replayed: false };
 }
 
-// The recorded draft for this key (a replay), or null for a new key. Throws if
-// the key was used for different content or its draft is still being created.
-async function recordedDraft(db, { actorUserId, key, fingerprint }) {
+// The draft already made for this key (a replay), or null when the key is free
+// to use. Throws if the key was used for different content, or if an earlier
+// attempt's outcome can't be settled yet.
+async function settledDraft(db, receipt, { config, fetcher, now }) {
   const row = await db
-    .prepare('SELECT fingerprint, status, response_json FROM message_draft_receipts WHERE actor_user_id = ? AND idempotency_key = ?')
-    .bind(actorUserId, key)
+    .prepare('SELECT fingerprint, status, response_json, created_at FROM message_draft_receipts WHERE actor_user_id = ? AND idempotency_key = ?')
+    .bind(receipt.actorUserId, receipt.key)
     .first();
   if (!row) return null;
-  if (row.fingerprint !== fingerprint) {
+  if (row.fingerprint !== receipt.fingerprint) {
     throw draftError('This request key was already used for a different message. Start a new draft.', 409);
   }
-  if (row.status !== 'created') {
-    throw draftError('This draft is still being created. Wait a moment, then check Resend before trying again.', 409);
+  if (row.status === 'created') return { ...JSON.parse(row.response_json), replayed: true };
+
+  // Pending: an earlier attempt is still running, or ended without knowing
+  // whether Resend created the draft. Resend's broadcast list settles it.
+  let found;
+  try {
+    found = await findBroadcast({ config, fetcher, marker: receipt.ref });
+  } catch (error) {
+    throw draftError(`HTV couldn't check Resend for this draft (${error.message}). Try again in a minute; it won't be created twice.`, 503);
   }
-  return { ...JSON.parse(row.response_json), replayed: true };
+  if (found) {
+    const result = { broadcastId: found.broadcastId, name: found.name, segmentId: found.segmentId, status: found.status || DRAFT_STATUS };
+    await recordCreated(db, receipt, result, now);
+    return { ...result, replayed: true };
+  }
+  const age = now.getTime() - Date.parse(row.created_at);
+  if (!(age >= PENDING_SETTLE_AFTER_MS)) {
+    throw draftError("This draft is still being confirmed with Resend. Check Resend, or try again in a few minutes; it won't be created twice.", 409);
+  }
+  await releaseReceipt(db, receipt, row.created_at);
+  return null;
+}
+
+function recordCreated(db, receipt, result, at) {
+  return db
+    .prepare(
+      `UPDATE message_draft_receipts SET status = 'created', broadcast_id = ?, response_json = ?, updated_at = ?
+       WHERE actor_user_id = ? AND idempotency_key = ? AND status = 'pending'`
+    )
+    .bind(result.broadcastId, JSON.stringify(result), at.toISOString(), receipt.actorUserId, receipt.key)
+    .run();
+}
+
+// Free the key, but only the reservation this attempt knows about: a newer
+// one belongs to another attempt.
+function releaseReceipt(db, receipt, reservedAt) {
+  return db
+    .prepare(
+      `DELETE FROM message_draft_receipts
+       WHERE actor_user_id = ? AND idempotency_key = ? AND status = 'pending' AND created_at = ?`
+    )
+    .bind(receipt.actorUserId, receipt.key, reservedAt)
+    .run();
 }
 
 // --- images ----------------------------------------------------------------

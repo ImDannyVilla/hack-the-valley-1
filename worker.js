@@ -36,6 +36,7 @@ import * as helperInterest from './functions/api/helper-interest.js';
 import * as adminMessageDrafts from './functions/api/admin/message-drafts/index.js';
 import * as adminMessageDraftImages from './functions/api/admin/message-drafts/images.js';
 import * as adminMessageDraftBlogPost from './functions/api/admin/message-drafts/blog-post.js';
+import * as adminMessageDraftAudience from './functions/api/admin/message-drafts/audience.js';
 import * as emailImage from './functions/api/email-images/[name].js';
 import * as adminBlogPosts from './functions/api/admin/blog-posts/index.js';
 import * as adminBlogPostPreview from './functions/api/admin/blog-posts/preview.js';
@@ -136,6 +137,10 @@ function matchApiRoute(pathname) {
 
   if (pathname === '/api/admin/message-drafts/blog-post') {
     return { routeModule: adminMessageDraftBlogPost, params: {} };
+  }
+
+  if (pathname === '/api/admin/message-drafts/audience') {
+    return { routeModule: adminMessageDraftAudience, params: {} };
   }
 
   if (pathname === '/api/admin/blog-posts' || pathname === '/api/admin/blog-posts/') {

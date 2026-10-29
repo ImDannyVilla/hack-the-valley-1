@@ -4,7 +4,9 @@
 // chips enabled. "Start from" loads a published blog post (file-based or
 // published from admin) into it, the preview fills fields with a sample
 // contact, and "Create Resend draft" sends one Idempotency-Key per draft
-// content to POST /api/admin/message-drafts.
+// content to POST /api/admin/message-drafts. "Goes to" shows the real
+// audience (the configured Resend segment and its current size); creating a
+// draft names that segment, so the server refuses if it changed meanwhile.
 //
 // Pure helpers are exported for tests; the DOM wiring only runs in a browser.
 
@@ -33,6 +35,14 @@ export function previewWithSampleContact(html, contact = PREVIEW_CONTACT) {
   return String(html || '').replace(CONTACT_TOKEN, (token, field, fallback = '') => escapeHtml(contact[field] ?? fallback));
 }
 
+// "General: 1,204 contacts (1,180 subscribed)". A sent broadcast skips
+// unsubscribed contacts, so that count is shown when it differs.
+export function audienceLabel({ name, contactCount = 0, subscribedCount = contactCount } = {}) {
+  const count = (n) => Number(n).toLocaleString('en-US');
+  const contacts = `${count(contactCount)} contact${contactCount === 1 ? '' : 's'}`;
+  return subscribedCount === contactCount ? `${name}: ${contacts}` : `${name}: ${contacts} (${count(subscribedCount)} subscribed)`;
+}
+
 async function postJson(path, body, headers = {}) {
   return readJson(await fetch(path, {
     method: 'POST',
@@ -47,7 +57,9 @@ function initMessageDraft() {
   const status = $('message-draft-status');
   const startSelect = $('message-draft-start');
   const postNote = $('message-draft-post-note');
+  const audienceLine = $('message-draft-audience');
   let postSlug = '';
+  let audience = null;
   // One Idempotency-Key per draft content. Keys are deliberately never
   // completed: re-submitting the same content replays the draft that already
   // exists instead of creating a duplicate; editing the content gets a new key.
@@ -124,6 +136,25 @@ function initMessageDraft() {
   // Posts published from the Blog section show up here without a reload.
   document.addEventListener('htv:blog-posts-changed', () => loadPostList());
 
+  // --- Goes to: the real audience a draft is addressed to ---------------------
+
+  const loadAudience = async () => {
+    audience = null;
+    audienceLine.textContent = 'Loading the audience…';
+    try {
+      const data = await readJson(await fetch('/api/admin/message-drafts/audience', { credentials: 'same-origin', headers: { Accept: 'application/json' } }));
+      audience = data.audience;
+      audienceLine.textContent = audienceLabel(audience);
+    } catch (error) {
+      audienceLine.textContent = `Couldn't load the audience: ${error.message}`;
+    }
+  };
+
+  $('message-draft-audience-refresh').addEventListener('click', () => loadAudience());
+  // The audience needs a signed-in admin and changes as people sign up; refresh
+  // it whenever the Email section opens.
+  document.querySelectorAll('[data-admin-nav="email"]').forEach((control) => control.addEventListener('click', () => loadAudience()));
+
   // --- Preview and draft -----------------------------------------------------
 
   const payload = (extra = {}) => ({
@@ -159,19 +190,23 @@ function initMessageDraft() {
       return;
     }
     if (tooLong()) return;
-    if (!window.confirm(`Create a Resend draft for "${subject}"? Nothing will be sent or scheduled from HTV admin.`)) return;
+    if (!audience) {
+      setStatus('Check who the draft goes to first: the audience above has not loaded. Use Refresh.', true);
+      return;
+    }
+    const goesTo = audienceLabel(audience);
+    if (!window.confirm(`Create a Resend draft of "${subject}" addressed to ${goesTo}? Nothing will be sent or scheduled from HTV admin.`)) return;
 
     const button = $('message-draft-create-draft');
     button.disabled = true;
     setStatus('Creating Resend draft…');
     try {
-      const body = payload();
+      const body = payload({ segmentId: audience.segmentId });
       const key = draftKeys.key('POST', '/api/admin/message-drafts', JSON.stringify(body));
       const data = await postJson('/api/admin/message-drafts', body, { 'Idempotency-Key': key });
-      const segment = data.segmentName || data.segmentId || 'placeholder segment';
       setStatus(data.replayed
-        ? `This draft already exists in Resend (broadcast ${data.broadcastId}); no duplicate was created. Edit the message to create a new draft.`
-        : `Draft created for "${data.subject}". Resend broadcast ${data.broadcastId}. Recipient placeholder: ${segment}. Review/change recipients in Resend before sending.`);
+        ? `This draft is already in Resend ("${data.name}"); no duplicate was created. Edit the message to make a new draft.`
+        : `Draft created in Resend as "${data.name}", addressed to ${goesTo}. Nothing was sent: review it and send it from Resend.`);
     } catch (error) {
       setStatus(error.message, true);
     } finally {
@@ -180,6 +215,7 @@ function initMessageDraft() {
   });
 
   loadPostList();
+  loadAudience();
 }
 
 if (typeof document !== 'undefined' && document.getElementById('message-draft-editor')) initMessageDraft();
