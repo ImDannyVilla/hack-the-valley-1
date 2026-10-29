@@ -51,11 +51,10 @@ test('API rejects cross-origin writes and missing retry keys, returns private pa
 });
 
 import {sponsorshipFixtureSql} from '../scripts/sponsorship-fixtures.mjs';
-test('scheduled worker captures overdue previews even when blog reconciliation fails',async t=>{
+test('scheduled worker captures overdue sponsorship previews',async t=>{
  const env=await setup(t);
  await env.HTV_DB.exec(sponsorshipFixtureSql(new Date('2026-09-24T16:00:00Z')));
  const prepare=env.HTV_DB.prepare.bind(env.HTV_DB);
- env.HTV_DB.prepare=sql=>{if(sql.includes('blog_broadcast_sends'))throw new Error('Injected blog failure');return prepare(sql);};
  env.RESEND_API_KEY='test-only-no-network';
  const log=console.error;console.error=()=>{};try{await worker.scheduled({scheduledTime:Date.parse('2026-09-24T16:00:00Z')},env);}finally{console.error=log;}
  assert.equal((await prepare('SELECT COUNT(*) AS n FROM sponsorship_reminder_digests').first()).n,2);

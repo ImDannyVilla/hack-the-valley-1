@@ -33,8 +33,16 @@ import * as register from './functions/api/register.js';
 import * as submissions from './functions/api/submissions.js';
 import * as subscribe from './functions/api/subscribe.js';
 import * as helperInterest from './functions/api/helper-interest.js';
-import * as blogBroadcast from './functions/api/blog/broadcast.js';
-import { reconcileBroadcastSends } from './functions/_lib/domain/blog-broadcast.js';
+import * as adminMessageDrafts from './functions/api/admin/message-drafts/index.js';
+import * as adminMessageDraftImages from './functions/api/admin/message-drafts/images.js';
+import * as adminMessageDraftBlogPost from './functions/api/admin/message-drafts/blog-post.js';
+import * as adminMessageDraftAudience from './functions/api/admin/message-drafts/audience.js';
+import * as emailImage from './functions/api/email-images/[name].js';
+import * as adminBlogPosts from './functions/api/admin/blog-posts/index.js';
+import * as adminBlogPostPreview from './functions/api/admin/blog-posts/preview.js';
+import * as adminBlogPost from './functions/api/admin/blog-posts/[id].js';
+import * as blogPosts from './functions/api/blog/posts.js';
+import { loadBlogPost } from './functions/_lib/domain/blog-post.js';
 import { getDb, getEvent, handleErrors, listEventInstances, listPublishedEventPhotos, renderEventPageHtml } from './functions/_lib/event-platform.js';
 import * as upload from './functions/api/upload.js';
 import * as users from './functions/api/users/index.js';
@@ -53,7 +61,7 @@ const API_ROUTES = {
   '/api/submissions': submissions,
   '/api/subscribe': subscribe,
   '/api/helper-interest': helperInterest,
-  '/api/blog/broadcast': blogBroadcast,
+  '/api/blog/posts': blogPosts,
   '/api/upload': upload,
   '/api/users': users,
 };
@@ -117,6 +125,40 @@ function matchApiRoute(pathname) {
 
   if (pathname === '/api/admin/audit') {
     return { routeModule: adminAudit, params: {} };
+  }
+
+  if (pathname === '/api/admin/message-drafts') {
+    return { routeModule: adminMessageDrafts, params: {} };
+  }
+
+  if (pathname === '/api/admin/message-drafts/images') {
+    return { routeModule: adminMessageDraftImages, params: {} };
+  }
+
+  if (pathname === '/api/admin/message-drafts/blog-post') {
+    return { routeModule: adminMessageDraftBlogPost, params: {} };
+  }
+
+  if (pathname === '/api/admin/message-drafts/audience') {
+    return { routeModule: adminMessageDraftAudience, params: {} };
+  }
+
+  if (pathname === '/api/admin/blog-posts' || pathname === '/api/admin/blog-posts/') {
+    return { routeModule: adminBlogPosts, params: {} };
+  }
+
+  if (pathname === '/api/admin/blog-posts/preview') {
+    return { routeModule: adminBlogPostPreview, params: {} };
+  }
+
+  const adminBlogPostMatch = pathname.match(/^\/api\/admin\/blog-posts\/([^/]+?)(?:\/(publish|unpublish))?\/?$/);
+  if (adminBlogPostMatch) {
+    return { routeModule: adminBlogPost, params: { id: decodeURIComponent(adminBlogPostMatch[1]), action: adminBlogPostMatch[2] || null } };
+  }
+
+  const emailImageMatch = pathname.match(/^\/api\/email-images\/([^/]+)$/);
+  if (emailImageMatch) {
+    return { routeModule: emailImage, params: { name: decodeURIComponent(emailImageMatch[1]) } };
   }
 
   if (pathname === '/api/admin/physical-resources' || pathname === '/api/admin/physical-resources/') {
@@ -285,6 +327,34 @@ async function renderEventPage(request, env) {
   });
 }
 
+// /blog/<slug>: file-based posts are static assets and normally never reach
+// the worker; a slug with no file lands here and is rendered from the
+// published admin posts.
+function isBlogPostPagePath(pathname) {
+  return /^\/blog\/[a-z0-9-]+\/?$/.test(pathname);
+}
+
+async function renderBlogPostPage(request, env) {
+  if (env.ASSETS?.fetch) {
+    const assetResponse = await env.ASSETS.fetch(request);
+    if (assetResponse.status < 400) return assetResponse;
+  }
+  const url = new URL(request.url);
+  const slug = url.pathname.match(/^\/blog\/([a-z0-9-]+)\/?$/)[1];
+  try {
+    const post = await loadBlogPost(env.ASSETS, slug, { origin: url.origin, db: getDb(env) });
+    return new Response(post.toPageHtml(), {
+      status: 200,
+      headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
+    });
+  } catch (error) {
+    if (error?.status === 404) {
+      return new Response('Post not found', { status: 404, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
+    }
+    return handleErrors(async () => { throw error; });
+  }
+}
+
 function isPublicProjectPagePath(pathname) {
   return /^\/projects\/[^/.][^/]*\/[^/.][^/]*\/?$/.test(pathname);
 }
@@ -439,6 +509,10 @@ export default {
       return renderEventPage(request, env);
     }
 
+    if (isBlogPostPagePath(url.pathname)) {
+      return renderBlogPostPage(request, env);
+    }
+
     if (isPhysicalResourceQrPath(url.pathname)) {
       return redirectPhysicalResourceQr(request);
     }
@@ -454,24 +528,10 @@ export default {
     return new Response('Not found', { status: 404 });
   },
 
-  // Cron (see wrangler.toml [triggers]): reconcile blog email-blast send-log
-  // rows against Resend's real broadcast status so a scheduled send advances to
-  // sending/sent/canceled instead of being assumed "sent" the moment it's queued.
+  // Cron (see wrangler.toml [triggers]): daily sponsorship reminder previews.
   async scheduled(event, env = {}, ctx = {}) {
     // The runtime keeps the invocation alive until this returned promise
-    // settles, so we just await the reconcile directly. Errors are swallowed
-    // (logged) so a transient Resend hiccup never fails the cron tick.
-    try {
-      const db = getDb(env);
-      // Production blog reconciliation retains its daily cadence. The separate
-      // local prototype ticks every 15 minutes to exercise overdue previews.
-      if (!event?.cron || event.cron === '0 15 * * *') {
-        const summary = await reconcileBroadcastSends(db, { env });
-        console.log('blog broadcast reconcile', summary);
-      }
-    } catch (err) {
-      console.error('blog broadcast reconcile failed', err);
-    }
+    // settles. Errors are logged so a transient failure never fails the tick.
     try {
       await runScheduledSponsorshipReminders(getDb(env), { env, scheduledTime: event?.scheduledTime });
     } catch (err) {

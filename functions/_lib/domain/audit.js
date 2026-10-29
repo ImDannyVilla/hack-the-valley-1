@@ -73,6 +73,16 @@ export async function appendAuditEvent(db, event) {
   return { ...normalized, metadata: storageMetadata };
 }
 
+// The INSERT for an audit event, to run in the same D1 batch (transaction) as
+// the change it records, so the change and its audit are stored together or
+// not at all. Batched writes go to audit_events only (migration 0020): there
+// is no legacy-table fallback inside a transaction.
+export function auditEventStatement(db, event) {
+  if (!db?.prepare) throw Object.assign(new Error("A D1 database binding is required."), { status: 500 });
+  const normalized = normalizeAuditEvent(event);
+  return genericAuditEventStatement(db, normalized, metadataForStorage(normalized));
+}
+
 function normalizeAuditEvent(event = {}) {
   const action = stringOrNull(event.action);
   if (!action) throw Object.assign(new Error("Audit action is required."), { status: 400, code: "validation_error" });
@@ -107,7 +117,11 @@ function metadataForStorage(event) {
 }
 
 async function insertGenericAuditEvent(db, event, metadata) {
-  await db.prepare(`
+  await genericAuditEventStatement(db, event, metadata).run();
+}
+
+function genericAuditEventStatement(db, event, metadata) {
+  return db.prepare(`
     INSERT INTO audit_events (id, action, actor_user_id, target_type, target_id, scope_type, scope_id, metadata_json, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).bind(
@@ -120,7 +134,7 @@ async function insertGenericAuditEvent(db, event, metadata) {
     event.scopeId,
     JSON.stringify(metadata),
     event.createdAt
-  ).run();
+  );
 }
 
 async function insertLegacyAdminAuditEvent(db, event, metadata) {

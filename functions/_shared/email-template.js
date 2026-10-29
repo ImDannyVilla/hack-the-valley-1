@@ -1,8 +1,8 @@
-// Pure email-rendering helpers: string transforms that turn already-extracted
-// post content into the HTML of a Resend email blast. No database, no Resend
-// calls, no lifecycle, and no knowledge of how a post is stored. Used privately
-// by the BlogPost domain object (functions/_lib/domain/blog-post.js); the blast
-// lifecycle lives in functions/_lib/domain/blog-broadcast.js.
+// Email template: pure helpers that wrap already-rendered message HTML in the
+// HTV email chrome (header, events CTA, reply prompt, unsubscribe footer). No
+// database, no Resend calls, and no knowledge of how messages or posts are
+// stored. Used by the MessageDraft domain object
+// (functions/_lib/domain/message-draft.js).
 
 // Rewrite root-relative src/href ("/images/...") to absolute URLs so they
 // resolve in an email client. Leaves protocol-relative and absolute URLs alone.
@@ -31,9 +31,9 @@ export const DEFAULT_BLOG_SUBMISSION_PROMPT = 'Want to highlight something on th
 
 // Build an email-friendly HTML document. Email clients ignore <style>/Tailwind,
 // so the chrome uses inline styles; the post body keeps its semantic tags.
-// The CTA block is platform-owned on purpose: every blog-post blast gets the
-// same event + submission prompts even if the source article forgets them.
-export function buildBroadcastEmailHtml({ title, contentHtml, postUrl, eventsUrl, submissionPrompt = DEFAULT_BLOG_SUBMISSION_PROMPT } = {}) {
+// The CTA block is platform-owned on purpose: every email gets the same event
+// + submission prompts, even one started from a post that forgets them.
+export function buildEmailHtml({ title, contentHtml, postUrl, eventsUrl, submissionPrompt = DEFAULT_BLOG_SUBMISSION_PROMPT } = {}) {
   const safeTitle = escapeHtml(title || 'Hack the Valley');
   const body = styleContentForEmail(contentHtml);
   const safeSubmissionPrompt = escapeHtml(submissionPrompt || DEFAULT_BLOG_SUBMISSION_PROMPT);
