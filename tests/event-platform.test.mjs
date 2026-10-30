@@ -843,18 +843,19 @@ test("admin page lists event instances as flat rows without dropdowns", () => {
   assert.doesNotMatch(html, /signup\.notes/);
 });
 
-test("admin page has one draft-only email composer that can start from a blog post", () => {
+test("admin page has one email composer that can start from a blog post and sends only after a typed confirmation", () => {
   const html = readFileSync(new URL("../public/admin.html", import.meta.url), "utf8");
   const composer = readFileSync(new URL("../public/admin-message-draft.js", import.meta.url), "utf8");
   assert.doesNotMatch(html, /id="blog-blast"|Blog email draft|blogBlastPayload|Past sends/);
   assert.match(html, /id="message-draft-start"/);
-  assert.match(html, /Create Resend draft/);
+  assert.match(html, /id="message-draft-send"[^>]*>Send now</);
+  assert.match(html, /Create a Resend draft/);
   assert.match(composer, /\/api\/admin\/message-drafts\/blog-post\?slug=/);
-  assert.match(composer, /Nothing will be sent or scheduled from HTV admin/);
+  assert.match(composer, /Type SEND to confirm/);
+  assert.match(composer, /This only creates the draft; nothing is sent/);
   for (const source of [html, composer]) {
     assert.doesNotMatch(source, /createDraft: true/);
-    assert.doesNotMatch(source, /Schedule send/);
-    assert.doesNotMatch(source, /Send now/);
+    assert.doesNotMatch(source, /Schedule send|scheduledAt|scheduled_at/, "nothing is scheduled from admin");
     assert.doesNotMatch(source, /sendBlogBlast/);
   }
 });

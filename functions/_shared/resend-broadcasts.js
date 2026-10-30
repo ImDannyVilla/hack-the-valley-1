@@ -1,12 +1,13 @@
 // Resend broadcasts adapter: the only code that talks to Resend's Broadcast
-// API. It creates draft broadcasts and never calls Resend's send or schedule
-// endpoints; organizers review a draft and send it from Resend. Callers (the
-// MessageDraft domain object) hand it an already-rendered email.
+// and Email APIs for admin email. It creates broadcasts, either as drafts or
+// sent as they are created (`send: true`, only after an admin confirms in the
+// composer), and emails one address for an admin's test. It never schedules.
+// Callers (the MessageDraft domain object) hand it an already-rendered email.
 //
-// Drafts are addressed to HTV's updates audience, the Resend segment in
+// Every broadcast is addressed to HTV's updates audience, the Resend segment in
 // RESEND_ALL_CONTACTS_SEGMENT_ID (General). Its contacts are real recipients,
 // so there is no fallback to another segment, and fetchDraftAudience gives its
-// name and current size for the admin to check before creating a draft.
+// name and current size for the admin to check before sending or drafting.
 //
 // History: blog blasts used to be scheduled and sent through here and logged
 // in the blog_broadcast_sends table (migration 0025), with a daily cron
@@ -15,6 +16,8 @@
 // dropping them would be a separate, approved migration.
 
 export const DRAFT_STATUS = 'draft';
+// Resend's status for a broadcast it is delivering.
+export const SENDING_STATUS = 'queued';
 
 // How long a create waits for Resend. Giving up leaves the outcome unknown
 // (Resend may still create the draft), so it is never treated as a refusal.
@@ -56,7 +59,7 @@ export function resolveBroadcastConfig(env = {}) {
   if (!from) missing.push('RESEND_BROADCAST_FROM');
   if (!segmentId) missing.push('RESEND_ALL_CONTACTS_SEGMENT_ID');
   if (missing.length) {
-    throw httpError(`Email drafts are not configured. Missing: ${missing.join(', ')}.`, 503);
+    throw httpError(`Admin email is not configured. Missing: ${missing.join(', ')}.`, 503);
   }
   return { apiKey, from, replyTo, segmentId };
 }
@@ -114,15 +117,19 @@ export async function fetchDraftAudience({ env = {}, fetcher = fetch } = {}) {
   };
 }
 
-// Create a draft broadcast to the configured audience and return its id. A
-// failure says whether the draft may exist anyway:
+// Create a broadcast to the configured audience and return its id: a draft,
+// or with `send` one that Resend sends as it creates it, in this one request,
+// so there is no separate send step that could fail or repeat on its own. A
+// failure says whether the broadcast may exist (and, with `send`, be going
+// out) anyway:
 //   created: false  Resend answered 4xx: it refused, so nothing was created;
 //   created: null   no answer (network error or timeout), a 5xx, or a success
 //                   without an id: Resend may have created it.
 // Only the first is safe to retry without checking Resend.
-export async function createBroadcast({ config, fetcher = fetch, subject, name, html, timeoutMs = CREATE_TIMEOUT_MS } = {}) {
+export async function createBroadcast({ config, fetcher = fetch, subject, name, html, send = false, timeoutMs = CREATE_TIMEOUT_MS } = {}) {
   const body = { segment_id: config.segmentId, from: config.from, subject, name, html };
   if (config.replyTo) body.reply_to = [config.replyTo];
+  if (send) body.send = true;
   let response;
   try {
     response = await fetcher('https://api.resend.com/broadcasts', {
@@ -147,9 +154,28 @@ export async function createBroadcast({ config, fetcher = fetch, subject, name, 
   return broadcastId;
 }
 
+// Email one address through Resend's Email API (not a broadcast), for an
+// admin's test of a draft. Resend fills no contact fields here, so the caller
+// fills them in first. Returns Resend's email id.
+export async function sendEmail({ config, fetcher = fetch, to, subject, html } = {}) {
+  const body = { from: config.from, to: [to], subject, html };
+  if (config.replyTo) body.reply_to = [config.replyTo];
+  const response = await fetcher('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${config.apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(CREATE_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    throw httpError(`Resend email send failed with HTTP ${response.status}: ${await readResponseText(response)}`, 502);
+  }
+  const sent = await response.json().catch(() => ({}));
+  return sent?.id || null;
+}
+
 // The broadcast whose name contains `marker`, or null. Callers put a unique
-// reference in each draft's name, so a create whose outcome is unknown can be
-// looked up afterwards.
+// reference in each broadcast's name, so a create whose outcome is unknown can
+// be looked up afterwards.
 export async function findBroadcast({ config, fetcher = fetch, marker } = {}) {
   const broadcasts = await fetchResendList({ apiKey: config.apiKey, fetcher, path: '/broadcasts' });
   const match = broadcasts.find((broadcast) => broadcast?.id && String(broadcast.name || '').includes(marker));

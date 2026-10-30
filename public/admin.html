@@ -71,7 +71,7 @@
           <a href="/admin/planning/" title="Event planning: occurrences, templates, and plan timelines (separate page)." class="rounded-2xl border border-bc-cyan/60 px-4 py-3 text-left text-bc-cyan hover:border-bc-cyan">Planning</a>
           <button type="button" data-admin-nav="people" title="Users, registrations, event signups, helper interest, volunteers, mentors, judges, and sponsors." class="rounded-2xl border border-slate-700 px-4 py-3 text-left text-slate-300 hover:border-bc-cyan">People</button>
           <button type="button" data-admin-nav="resources" title="Physical inventory: equipment, supplies, checkouts, returns, photos, and assignment history." class="rounded-2xl border border-slate-700 px-4 py-3 text-left text-slate-300 hover:border-bc-cyan">Resources</button>
-          <button type="button" data-admin-nav="email" title="Write an email or start from a blog post, preview it, and create a Resend draft." class="rounded-2xl border border-slate-700 px-4 py-3 text-left text-slate-300 hover:border-bc-cyan">Email</button>
+          <button type="button" data-admin-nav="email" title="Write an email or start from a blog post, preview it, test it, and send it." class="rounded-2xl border border-slate-700 px-4 py-3 text-left text-slate-300 hover:border-bc-cyan">Email</button>
           <button type="button" data-admin-nav="blog" title="Write, preview, and publish posts on hackthevalley.org/blog." class="rounded-2xl border border-slate-700 px-4 py-3 text-left text-slate-300 hover:border-bc-cyan">Blog</button>
           <a href="/admin-sponsorships" title="Sponsorships: outreach, contacts, commitments, payments, and overdue follow-ups (separate page)." class="rounded-2xl border border-slate-700 px-4 py-3 text-left text-slate-300 hover:border-bc-cyan">Sponsorships</a>
           <button id="access-admin-nav" title="Grant or revoke global admin access. Isolated from normal event operations on purpose." type="button" data-admin-nav="access" class="hidden rounded-2xl border border-violet-500/50 px-4 py-3 text-left text-violet-200 hover:border-violet-300">Access</button>
@@ -343,8 +343,8 @@
 
       <section id="message-draft" data-admin-section="email" class="hidden bg-bc-navy border border-slate-700 rounded-2xl p-6 mt-8">
         <div class="mb-4">
-          <h2 class="text-2xl font-black">Email draft</h2>
-          <p class="text-sm text-slate-400 mt-1">Write an announcement or start from a blog post, preview it, then create a Resend draft. Sending happens in Resend, not here.</p>
+          <h2 class="text-2xl font-black">Email</h2>
+          <p class="text-sm text-slate-400 mt-1">Write an announcement or start from a blog post, preview it, send yourself a test, then send it to the audience below.</p>
         </div>
         <div class="grid lg:grid-cols-[1fr_1.2fr] gap-6">
           <div class="space-y-4">
@@ -382,12 +382,14 @@
                 <button id="message-draft-audience-refresh" type="button" class="text-xs font-bold text-bc-cyan hover:underline">Refresh</button>
               </div>
               <p id="message-draft-audience" class="text-sm text-slate-200">Loading the audience…</p>
-              <p class="text-xs text-slate-400">The draft is addressed to this Resend segment. These are real contacts, and only they get it; contacts outside the segment don't. This screen only creates the draft; review it and send it from Resend.</p>
+              <p class="text-xs text-slate-400">The email is addressed to this Resend segment. These are real contacts, and only they get it; contacts outside the segment don't. Send now emails them right away, after you type SEND to confirm.</p>
             </div>
             <div class="flex flex-wrap gap-3">
               <button id="message-draft-preview" type="button" class="border border-bc-cyan text-bc-cyan px-5 py-3 rounded-lg font-bold hover:bg-bc-cyan hover:text-bc-dark">Preview email</button>
-              <button id="message-draft-create-draft" type="button" class="bg-bc-cyan text-bc-dark px-5 py-3 rounded-lg font-bold hover:bg-cyan-400 disabled:opacity-50">Create Resend draft</button>
+              <button id="message-draft-test" type="button" class="border border-bc-cyan text-bc-cyan px-5 py-3 rounded-lg font-bold hover:bg-bc-cyan hover:text-bc-dark disabled:opacity-50">Send me a test</button>
+              <button id="message-draft-send" type="button" class="bg-bc-cyan text-bc-dark px-5 py-3 rounded-lg font-bold hover:bg-cyan-400 disabled:opacity-50">Send now</button>
             </div>
+            <p class="text-xs text-slate-400">Want to schedule it or edit it in Resend instead? <button id="message-draft-create-draft" type="button" class="font-bold text-bc-cyan hover:underline disabled:opacity-50">Create a Resend draft</button>; nothing is sent.</p>
             <p id="message-draft-status" class="text-sm text-slate-300"></p>
           </div>
           <div>

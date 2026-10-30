@@ -3,17 +3,28 @@
 // MessageDraft in docs/domain-model.md). It owns the draft's rules: a required
 // subject and message within limits, the optional blog post (a ContentItem) it
 // was started from and links back to, how it renders as an email, the images
-// it may carry, and how it becomes a Resend draft at most once per request,
-// addressed to the audience the admin was shown.
+// it may carry, and how it reaches Resend at most once per request, addressed
+// to the audience the admin was shown: as a Resend draft, or sent.
 //
-// Sending stays a human step in Resend: nothing here calls Resend's send or
-// schedule endpoints. Pure formatting lives in functions/_shared/message-format.js
-// and functions/_shared/email-template.js; Resend calls live in
+// Sending is approval-gated (docs/domain-model.md): the composer sends only
+// after the signed-in admin types SEND to confirm the audience and count, and
+// every send is audited. A test email goes only to the admin. Nothing here
+// schedules. Pure formatting lives in functions/_shared/message-format.js and
+// functions/_shared/email-template.js; Resend calls live in
 // functions/_shared/resend-broadcasts.js.
 
 import { absolutizeUrls, buildEmailHtml } from '../../_shared/email-template.js';
-import { MESSAGE_LIMITS, messageBodyHtml } from '../../_shared/message-format.js';
-import { BROADCAST_NAME_MAX, DRAFT_STATUS, createBroadcast, findBroadcast, resolveBroadcastConfig } from '../../_shared/resend-broadcasts.js';
+import { MESSAGE_LIMITS, fillContactFields, messageBodyHtml } from '../../_shared/message-format.js';
+import {
+  BROADCAST_NAME_MAX,
+  DRAFT_STATUS,
+  SENDING_STATUS,
+  createBroadcast,
+  findBroadcast,
+  resolveBroadcastConfig,
+  sendEmail,
+} from '../../_shared/resend-broadcasts.js';
+import { auditEventStatement, buildAuditEvent } from './audit.js';
 import { loadBlogPost } from './blog-post.js';
 
 function draftError(message, status = 400) {
@@ -80,10 +91,10 @@ export class MessageDraft {
   }
 }
 
-// --- creating the Resend draft, once per request ----------------------------
+// --- handing a draft to Resend, once per request -----------------------------
 
-// The composer sends one Idempotency-Key per draft content (the same pattern
-// as sponsorship writes); the same content keeps the same key.
+// The composer sends one Idempotency-Key per request content (the same
+// pattern as sponsorship writes); the same content keeps the same key.
 const REQUEST_KEY = /^[\w.:-]{8,150}$/;
 
 // How long a create with an unknown outcome stays pending before HTV may
@@ -92,38 +103,57 @@ const REQUEST_KEY = /^[\w.:-]{8,150}$/;
 export const PENDING_SETTLE_AFTER_MS = 5 * 60 * 1000;
 
 // Create the Resend draft for a MessageDraft at most once per (admin, key).
+// Nothing is sent: the admin reviews, schedules, or sends it in Resend.
+export function createResendDraft(db, draft, options = {}) {
+  return handOff(db, draft, { ...options, send: false });
+}
+
+// Send a MessageDraft to the audience now, at most once per (admin, key). This
+// is the approval-gated step: the composer calls it only after the admin types
+// SEND to confirm the audience and count. Resend sends the broadcast as it
+// creates it, so this is the same hand-off as a draft and a retry never sends
+// again. Each send is recorded with a message_draft.send audit event, in the
+// same batch as its receipt.
+export function sendMessageDraft(db, draft, options = {}) {
+  return handOff(db, draft, { ...options, send: true });
+}
+
 // Resend can't deduplicate broadcast creates, so the key is reserved
-// ('pending') in message_draft_receipts (migration 0031), the draft is created
-// with the reservation's reference in its name, and the result is recorded
-// ('created'). A retry with the same key and content replays the recorded
-// draft; the same key with different content is refused.
+// ('pending') in message_draft_receipts (migration 0031), the broadcast is
+// created with the reservation's reference in its name, and the result is
+// recorded ('created'). A retry with the same key and content replays the
+// recorded broadcast; the same key with different content (or a draft's key
+// reused for a send) is refused.
 //
 // Only a definite rejection from Resend (a 4xx) releases the key. Any other
 // failure (no answer, a 5xx, a lost response, or failing to record the
 // returned id) leaves it pending, and the next attempt settles it before
-// anything is created: a draft carrying the reference in Resend is recorded
-// and replayed; if there is none once PENDING_SETTLE_AFTER_MS has passed, the
-// key is released and the draft created.
+// anything is created: a broadcast carrying the reference in Resend is
+// recorded and replayed; if there is none once PENDING_SETTLE_AFTER_MS has
+// passed, the key is released and the broadcast created.
 //
 // `segmentId` is the audience the admin was shown. It must still be the
-// configured one, so a draft never goes to a list the admin didn't check.
-export async function createResendDraft(db, draft, { actorUserId, key, segmentId, baseUrl, env = {}, fetcher = fetch, now = new Date() } = {}) {
-  if (!actorUserId) throw draftError('A signed-in admin is required to create drafts.', 403);
+// configured one, so nothing goes to a list the admin didn't check.
+async function handOff(db, draft, { actorUserId, key, segmentId, baseUrl, env = {}, fetcher = fetch, now = new Date(), send }) {
+  if (!actorUserId) throw draftError(`A signed-in admin is required to ${send ? 'send emails' : 'create drafts'}.`, 403);
   if (typeof key !== 'string' || !REQUEST_KEY.test(key)) throw draftError('A valid Idempotency-Key is required.');
   const config = resolveBroadcastConfig(env);
+  const content = await draft.fingerprint();
   const receipt = {
     actorUserId,
     key,
-    fingerprint: await draft.fingerprint(),
+    send,
+    draft,
+    fingerprint: send ? await sha256Hex(`send\n${content}`) : content,
     ref: `ref ${(await sha256Hex(`${actorUserId}\n${key}`)).slice(0, 12)}`,
   };
 
-  const settled = await settledDraft(db, receipt, { config, fetcher, now });
+  const settled = await settledReceipt(db, receipt, { config, fetcher, now });
   if (settled) return settled;
   if (segmentId !== config.segmentId) {
     throw draftError(segmentId
-      ? 'The email audience changed after this page loaded it. Refresh it, check who the draft goes to, then create it again.'
-      : 'Load the email audience first, so you can check who the draft goes to.', 409);
+      ? 'The email audience changed after this page loaded it. Refresh it, check who it goes to, then try again.'
+      : 'Load the email audience first, so you can check who it goes to.', 409);
   }
 
   const name = nameWithRef(draft.broadcastName(), receipt.ref);
@@ -139,45 +169,49 @@ export async function createResendDraft(db, draft, { actorUserId, key, segmentId
       .run();
   } catch (error) {
     // A concurrent request with the same key reserved it first.
-    const concurrent = await settledDraft(db, receipt, { config, fetcher, now });
+    const concurrent = await settledReceipt(db, receipt, { config, fetcher, now });
     if (concurrent) return concurrent;
     throw error;
   }
 
   let broadcastId;
   try {
-    broadcastId = await createBroadcast({ config, fetcher, subject: draft.subject, name, html });
+    broadcastId = await createBroadcast({ config, fetcher, subject: draft.subject, name, html, send });
   } catch (error) {
     if (error.created === false) {
       await releaseReceipt(db, receipt, reservedAt);
       throw error;
     }
-    throw draftError(
-      `Resend didn't confirm the draft (${error.message}). HTV is holding it so it can't be created twice: it may already be in Resend as "${name}". Trying again in a few minutes records it, or creates it if it isn't there.`,
-      502,
-    );
+    throw draftError(send
+      ? `Resend didn't confirm the send (${error.message}). HTV is holding it so it can't go out twice: Resend may already be sending "${name}". Check Resend's broadcasts; trying again in a few minutes records it, or sends it if it never went out.`
+      : `Resend didn't confirm the draft (${error.message}). HTV is holding it so it can't be created twice: it may already be in Resend as "${name}". Trying again in a few minutes records it, or creates it if it isn't there.`,
+    502);
   }
 
-  const result = { broadcastId, name, segmentId: config.segmentId, status: DRAFT_STATUS };
+  const result = { broadcastId, name, segmentId: config.segmentId, status: send ? SENDING_STATUS : DRAFT_STATUS };
   try {
-    await recordCreated(db, receipt, result, new Date());
+    await recordResult(db, receipt, result, new Date());
   } catch {
-    throw draftError(
-      `Resend created the draft "${name}" (broadcast ${broadcastId}), but HTV couldn't record it. It's in Resend, so don't create it again; trying again later records it.`,
-      500,
-    );
+    throw draftError(send
+      ? `Resend is sending "${name}" (broadcast ${broadcastId}), but HTV couldn't record it. Don't send it again; trying again later records it.`
+      : `Resend created the draft "${name}" (broadcast ${broadcastId}), but HTV couldn't record it. It's in Resend, so don't create it again; trying again later records it.`,
+    500);
   }
   return { ...result, replayed: false };
 }
 
-// The draft already made for this key (a replay), or null when the key is free
-// to use. Throws if the key was used for different content, or if an earlier
-// attempt's outcome can't be settled yet.
-async function settledDraft(db, receipt, { config, fetcher, now }) {
-  const row = await db
+function findReceipt(db, receipt) {
+  return db
     .prepare('SELECT fingerprint, status, response_json, created_at FROM message_draft_receipts WHERE actor_user_id = ? AND idempotency_key = ?')
     .bind(receipt.actorUserId, receipt.key)
     .first();
+}
+
+// What Resend already made for this key (a replay), or null when the key is
+// free to use. Throws if the key was used for different content, or if an
+// earlier attempt's outcome can't be settled yet.
+async function settledReceipt(db, receipt, { config, fetcher, now }) {
+  const row = await findReceipt(db, receipt);
   if (!row) return null;
   if (row.fingerprint !== receipt.fingerprint) {
     throw draftError('This request key was already used for a different message. Start a new draft.', 409);
@@ -185,21 +219,22 @@ async function settledDraft(db, receipt, { config, fetcher, now }) {
   if (row.status === 'created') return { ...JSON.parse(row.response_json), replayed: true };
 
   // Pending: an earlier attempt is still running, or ended without knowing
-  // whether Resend created the draft. Resend's broadcast list settles it.
+  // whether Resend created the broadcast. Resend's broadcast list settles it.
   let found;
   try {
     found = await findBroadcast({ config, fetcher, marker: receipt.ref });
   } catch (error) {
-    throw draftError(`HTV couldn't check Resend for this draft (${error.message}). Try again in a minute; it won't be created twice.`, 503);
+    throw draftError(`HTV couldn't check Resend for this email (${error.message}). Try again in a minute; nothing will go out twice.`, 503);
   }
   if (found) {
-    const result = { broadcastId: found.broadcastId, name: found.name, segmentId: found.segmentId, status: found.status || DRAFT_STATUS };
-    await recordCreated(db, receipt, result, now);
+    const status = found.status || (receipt.send ? SENDING_STATUS : DRAFT_STATUS);
+    const result = { broadcastId: found.broadcastId, name: found.name, segmentId: found.segmentId, status };
+    await recordResult(db, receipt, result, now);
     return { ...result, replayed: true };
   }
   const age = now.getTime() - Date.parse(row.created_at);
   if (!(age >= PENDING_SETTLE_AFTER_MS)) {
-    throw draftError("This draft is still being confirmed with Resend. Check Resend, or try again in a few minutes; it won't be created twice.", 409);
+    throw draftError("This email is still being confirmed with Resend. Check Resend, or try again in a few minutes; nothing will go out twice.", 409);
   }
   await releaseReceipt(db, receipt, row.created_at);
   return null;
@@ -217,14 +252,40 @@ function nameWithRef(label, ref) {
   return `${chars.join('').trimEnd()}…${suffix}`;
 }
 
-function recordCreated(db, receipt, result, at) {
-  return db
+// Record what Resend made for this key. A send is recorded together with its
+// audit event, in one batch, so neither is stored without the other. The
+// event's id comes from the request: if a racing attempt recorded the send
+// first, this batch fails on that id, and the send is already recorded.
+async function recordResult(db, receipt, result, at) {
+  const update = db
     .prepare(
       `UPDATE message_draft_receipts SET status = 'created', broadcast_id = ?, response_json = ?, updated_at = ?
        WHERE actor_user_id = ? AND idempotency_key = ? AND status = 'pending'`
     )
-    .bind(result.broadcastId, JSON.stringify(result), at.toISOString(), receipt.actorUserId, receipt.key)
-    .run();
+    .bind(result.broadcastId, JSON.stringify(result), at.toISOString(), receipt.actorUserId, receipt.key);
+  if (!receipt.send) {
+    await update.run();
+    return;
+  }
+  const audit = {
+    ...buildAuditEvent({
+      action: 'message_draft.send',
+      actorUserId: receipt.actorUserId,
+      targetType: 'resend_broadcast',
+      targetId: result.broadcastId,
+      scopeType: 'global',
+      scopeId: '*',
+      metadata: { subject: receipt.draft.subject, name: result.name, segmentId: result.segmentId, postSlug: receipt.draft.post?.slug || null },
+      createdAt: at.toISOString(),
+    }),
+    id: `audit_${(await sha256Hex(`message_draft.send\n${receipt.actorUserId}\n${receipt.key}`)).slice(0, 32)}`,
+  };
+  try {
+    await db.batch([auditEventStatement(db, audit), update]);
+  } catch (error) {
+    if ((await findReceipt(db, receipt))?.status === 'created') return;
+    throw error;
+  }
 }
 
 // Free the key, but only the reservation this attempt knows about: a newer
@@ -237,6 +298,27 @@ function releaseReceipt(db, receipt, reservedAt) {
     )
     .bind(receipt.actorUserId, receipt.key, reservedAt)
     .run();
+}
+
+// --- a test email to yourself ------------------------------------------------
+
+// Email this draft to the signed-in admin only, to check it in a real inbox
+// before sending. Resend fills contact fields only in broadcasts, so they are
+// filled here from the admin's own account. Nothing goes to the audience, and
+// a test is not a send: it isn't audited or deduplicated.
+export async function sendTestEmail(draft, { to, name = '', baseUrl, env = {}, fetcher = fetch } = {}) {
+  const address = String(to || '').trim();
+  if (!address) throw draftError('Your account has no email address to send the test to.', 400);
+  const config = resolveBroadcastConfig(env);
+  const base = String(baseUrl || '').replace(/\/+$/, '');
+  const [firstName = '', ...lastName] = String(name || '').trim().split(/\s+/);
+  const html = fillContactFields(
+    draft.toEmailHtml({ baseUrl: base }),
+    { first_name: firstName, last_name: lastName.join(' '), email: address },
+    { unsubscribeUrl: `${base}/` },
+  );
+  const emailId = await sendEmail({ config, fetcher, to: address, subject: `[Test] ${draft.subject}`, html });
+  return { to: address, emailId };
 }
 
 // --- images ----------------------------------------------------------------

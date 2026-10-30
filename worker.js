@@ -37,6 +37,8 @@ import * as adminMessageDrafts from './functions/api/admin/message-drafts/index.
 import * as adminMessageDraftImages from './functions/api/admin/message-drafts/images.js';
 import * as adminMessageDraftBlogPost from './functions/api/admin/message-drafts/blog-post.js';
 import * as adminMessageDraftAudience from './functions/api/admin/message-drafts/audience.js';
+import * as adminMessageDraftSend from './functions/api/admin/message-drafts/send.js';
+import * as adminMessageDraftTest from './functions/api/admin/message-drafts/test.js';
 import * as emailImage from './functions/api/email-images/[name].js';
 import * as adminBlogPosts from './functions/api/admin/blog-posts/index.js';
 import * as adminBlogPostPreview from './functions/api/admin/blog-posts/preview.js';
@@ -141,6 +143,14 @@ function matchApiRoute(pathname) {
 
   if (pathname === '/api/admin/message-drafts/audience') {
     return { routeModule: adminMessageDraftAudience, params: {} };
+  }
+
+  if (pathname === '/api/admin/message-drafts/send') {
+    return { routeModule: adminMessageDraftSend, params: {} };
+  }
+
+  if (pathname === '/api/admin/message-drafts/test') {
+    return { routeModule: adminMessageDraftTest, params: {} };
   }
 
   if (pathname === '/api/admin/blog-posts' || pathname === '/api/admin/blog-posts/') {

@@ -26,6 +26,18 @@ export const MESSAGE_FIELDS = Object.freeze([
   { label: 'Email', token: '{{{contact.email}}}' },
 ]);
 
+const CONTACT_FIELD = /\{\{\{contact\.([a-z_]+)(?:\|([^}]*))?\}\}\}/g;
+
+// Fill the contact fields the way Resend does for each recipient of a
+// broadcast, for an email sent outside one (an admin's test to themselves). A
+// missing value uses the field's fallback ("there"), and the unsubscribe link
+// points at `unsubscribeUrl`.
+export function fillContactFields(html, contact = {}, { unsubscribeUrl = '#' } = {}) {
+  return String(html || '')
+    .replace(CONTACT_FIELD, (token, field, fallback = '') => escapeHtml(contact[field] || fallback))
+    .replaceAll('{{{RESEND_UNSUBSCRIBE_URL}}}', unsubscribeUrl);
+}
+
 // Image widths in email pixels: the email body is 600px wide with 24px
 // padding, so 552px is full width.
 export const MESSAGE_IMAGE_WIDTH = Object.freeze({ min: 80, max: 552 });

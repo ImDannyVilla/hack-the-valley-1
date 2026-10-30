@@ -12,6 +12,12 @@ export function absolutizeUrls(html, baseUrl) {
   return String(html || '').replace(/(\s(?:src|href))="\/(?!\/)/g, `$1="${base}/`);
 }
 
+// The site URL that links and images in an email point at: SITE_BASE_URL, or
+// the origin the admin is working on.
+export function emailBaseUrl(request, env = {}) {
+  return String(env.SITE_BASE_URL || new URL(request.url).origin).replace(/\/+$/, '');
+}
+
 // Email clients ignore <style>/Tailwind, so any sizing the web page relied on
 // is gone. Inline a width constraint on every image (otherwise full-resolution
 // screenshots overflow the email width) and lightly style figure captions.

@@ -15,6 +15,7 @@ import {
   fetchDraftAudience,
   findBroadcast,
   resolveBroadcastConfig,
+  sendEmail,
 } from '../functions/_shared/resend-broadcasts.js';
 import { onRequestGet as getPost, onRequest as postRouteFallback } from '../functions/api/admin/message-drafts/blog-post.js';
 import { createFakeResend } from './helpers/fake-resend.mjs';
@@ -214,6 +215,26 @@ test('createBroadcast posts the configured segment, sender, and reply-to, and re
   assert.equal(createBody.from, 'HTV <a@b.co>');
   assert.deepEqual(createBody.reply_to, ['contact@hackthevalley.org']);
   assert.ok(calls[0].init.signal, 'the create has a timeout');
+  assert.equal('send' in createBody, false, 'a draft is never sent');
+});
+
+test('createBroadcast with send asks Resend to send it as it is created, in the same request', async () => {
+  const calls = [];
+  await createBroadcast({ config: CONFIG, fetcher: mockFetch([{ status: 200, body: { id: 'bc_sent' } }], calls), subject: 's', name: 'n', html: 'h', send: true });
+  assert.deepEqual(calls.map((call) => call.url), ['https://api.resend.com/broadcasts']);
+  assert.equal(JSON.parse(calls[0].init.body).send, true);
+});
+
+test('sendEmail emails one address through the Email API, never a broadcast', async () => {
+  const calls = [];
+  const id = await sendEmail({ config: CONFIG, fetcher: mockFetch([{ status: 200, body: { id: 'em_1' } }], calls), to: 'admin@example.com', subject: '[Test] s', html: '<p>h</p>' });
+  assert.equal(id, 'em_1');
+  assert.equal(calls[0].url, 'https://api.resend.com/emails');
+  assert.deepEqual(JSON.parse(calls[0].init.body), { from: 'HTV <a@b.co>', to: ['admin@example.com'], subject: '[Test] s', html: '<p>h</p>', reply_to: ['contact@hackthevalley.org'] });
+  await assert.rejects(
+    sendEmail({ config: CONFIG, fetcher: mockFetch([{ status: 422, body: { message: 'bad' } }]), to: 'a@b.co', subject: 's', html: 'h' }),
+    (error) => error.status === 502 && /HTTP 422/.test(error.message),
+  );
 });
 
 test('createBroadcast says whether a failed create may still have made the draft', async () => {

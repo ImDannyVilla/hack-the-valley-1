@@ -2,11 +2,15 @@
 //
 // The message box is the shared editor (admin-message-editor.js) with field
 // chips enabled. "Start from" loads a published blog post (file-based or
-// published from admin) into it, the preview fills fields with a sample
-// contact, and "Create Resend draft" sends one Idempotency-Key per draft
-// content to POST /api/admin/message-drafts. "Goes to" shows the real
-// audience (the configured Resend segment and its current size); creating a
-// draft names that segment, so the server refuses if it changed meanwhile.
+// published from admin) into it, and the preview fills fields with a sample
+// contact. "Goes to" shows the real audience (the configured Resend segment
+// and its current size). Then:
+//   - "Send me a test" emails it to the signed-in admin only;
+//   - "Send now" sends it to the audience, after the admin types SEND;
+//   - "create a Resend draft" hands it to Resend unsent, to schedule there.
+// A send or draft names the segment that was shown, so the server refuses if
+// it changed meanwhile, and carries one Idempotency-Key per request content,
+// so repeating it never sends or creates twice.
 //
 // Pure helpers are exported for tests; the DOM wiring only runs in a browser.
 
@@ -43,6 +47,11 @@ export function audienceLabel({ name, contactCount = 0, subscribedCount = contac
   return subscribedCount === contactCount ? `${name}: ${contacts}` : `${name}: ${contacts} (${count(subscribedCount)} subscribed)`;
 }
 
+// Sending reaches real people and can't be undone, so the admin types SEND.
+export function isSendConfirmation(typed) {
+  return String(typed ?? '').trim().toUpperCase() === 'SEND';
+}
+
 async function postJson(path, body, headers = {}) {
   return readJson(await fetch(path, {
     method: 'POST',
@@ -60,10 +69,10 @@ function initMessageDraft() {
   const audienceLine = $('message-draft-audience');
   let postSlug = '';
   let audience = null;
-  // One Idempotency-Key per draft content. Keys are deliberately never
-  // completed: re-submitting the same content replays the draft that already
-  // exists instead of creating a duplicate; editing the content gets a new key.
-  const draftKeys = createMutationKeyStore();
+  // One Idempotency-Key per request (path and content). Keys are deliberately
+  // never completed: repeating a send or draft replays the one that already
+  // exists instead of sending or creating it again; editing gets a new key.
+  const requestKeys = createMutationKeyStore();
 
   const setStatus = (message, error = false) => {
     status.className = `text-sm ${error ? 'text-red-300' : 'text-slate-300'}`;
@@ -155,7 +164,7 @@ function initMessageDraft() {
   // it whenever the Email section opens.
   document.querySelectorAll('[data-admin-nav="email"]').forEach((control) => control.addEventListener('click', () => loadAudience()));
 
-  // --- Preview and draft -----------------------------------------------------
+  // --- Preview, test, send, and draft ----------------------------------------
 
   const payload = (extra = {}) => ({
     subject: $('message-draft-subject').value.trim(),
@@ -183,35 +192,76 @@ function initMessageDraft() {
     }
   });
 
-  $('message-draft-create-draft').addEventListener('click', async () => {
-    const subject = $('message-draft-subject').value.trim();
-    if (!subject) {
+  // A test needs a subject and a message within the limit; a send or a draft
+  // also needs the audience on screen, since it names that segment.
+  const ready = ({ audienceNeeded = true } = {}) => {
+    if (!$('message-draft-subject').value.trim()) {
       setStatus('Add a subject line first.', true);
-      return;
+      return false;
     }
-    if (tooLong()) return;
-    if (!audience) {
-      setStatus('Check who the draft goes to first: the audience above has not loaded. Use Refresh.', true);
-      return;
+    if (tooLong()) return false;
+    if (audienceNeeded && !audience) {
+      setStatus('Check who it goes to first: the audience above has not loaded. Use Refresh.', true);
+      return false;
     }
-    const goesTo = audienceLabel(audience);
-    if (!window.confirm(`Create a Resend draft of "${subject}" addressed to ${goesTo}? Nothing will be sent or scheduled from HTV admin.`)) return;
+    return true;
+  };
 
-    const button = $('message-draft-create-draft');
+  // Run one request with its button disabled; the status line shows the result.
+  const busy = async (button, pending, run) => {
     button.disabled = true;
-    setStatus('Creating Resend draft…');
+    setStatus(pending);
     try {
-      const body = payload({ segmentId: audience.segmentId });
-      const key = draftKeys.key('POST', '/api/admin/message-drafts', JSON.stringify(body));
-      const data = await postJson('/api/admin/message-drafts', body, { 'Idempotency-Key': key });
-      setStatus(data.replayed
-        ? `This draft is already in Resend ("${data.name}"); no duplicate was created. Edit the message to make a new draft.`
-        : `Draft created in Resend as "${data.name}", addressed to ${goesTo}. Nothing was sent: review it and send it from Resend.`);
+      setStatus(await run());
     } catch (error) {
       setStatus(error.message, true);
     } finally {
       button.disabled = false;
     }
+  };
+
+  const handOff = (path) => {
+    const body = payload({ segmentId: audience.segmentId });
+    return postJson(path, body, { 'Idempotency-Key': requestKeys.key('POST', path, JSON.stringify(body)) });
+  };
+
+  $('message-draft-test').addEventListener('click', () => {
+    if (!ready({ audienceNeeded: false })) return;
+    busy($('message-draft-test'), 'Sending you a test…', async () => {
+      const data = await postJson('/api/admin/message-drafts/test', payload());
+      return `Test sent to ${data.to}, with the fields filled in from your account. Nothing went to the audience.`;
+    });
+  });
+
+  $('message-draft-send').addEventListener('click', () => {
+    if (!ready()) return;
+    const subject = $('message-draft-subject').value.trim();
+    const goesTo = audienceLabel(audience);
+    const typed = window.prompt(`Send "${subject}" to ${goesTo} now? It goes out right away and can't be undone.\n\nType SEND to confirm.`);
+    if (typed === null) return;
+    if (!isSendConfirmation(typed)) {
+      setStatus('Not sent: type SEND to confirm.', true);
+      return;
+    }
+    busy($('message-draft-send'), `Sending to ${goesTo}…`, async () => {
+      const data = await handOff('/api/admin/message-drafts/send');
+      return data.replayed
+        ? `This email was already sent ("${data.name}"), so it was not sent again. Edit the message to send a new one.`
+        : `Sent to ${goesTo}. Resend is delivering it now ("${data.name}").`;
+    });
+  });
+
+  $('message-draft-create-draft').addEventListener('click', () => {
+    if (!ready()) return;
+    const subject = $('message-draft-subject').value.trim();
+    const goesTo = audienceLabel(audience);
+    if (!window.confirm(`Create a Resend draft of "${subject}" addressed to ${goesTo}? This only creates the draft; nothing is sent.`)) return;
+    busy($('message-draft-create-draft'), 'Creating Resend draft…', async () => {
+      const data = await handOff('/api/admin/message-drafts');
+      return data.replayed
+        ? `This draft is already in Resend ("${data.name}"); no duplicate was created. Edit the message to make a new draft.`
+        : `Draft created in Resend as "${data.name}", addressed to ${goesTo}. Nothing was sent: review, schedule, or send it from Resend.`;
+    });
   });
 
   loadPostList();

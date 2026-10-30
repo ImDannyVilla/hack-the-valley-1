@@ -7,10 +7,7 @@ import {
   requireAdmin,
 } from '../../../_lib/event-platform.js';
 import { MessageDraft, createResendDraft } from '../../../_lib/domain/message-draft.js';
-
-function baseUrl(request, env) {
-  return String(env.SITE_BASE_URL || new URL(request.url).origin).replace(/\/+$/, '');
-}
+import { emailBaseUrl } from '../../../_shared/email-template.js';
 
 // POST /api/admin/message-drafts  { subject, heading?, message, postSlug?, segmentId, dryRun? }
 // Admin-only. dryRun returns the rendered email for preview. Otherwise creates
@@ -24,7 +21,7 @@ export async function onRequestPost(context) {
 
     const input = await readJson(request);
     const draft = await MessageDraft.fromInput(input, { assets: env.ASSETS, origin: new URL(request.url).origin, db: getDb(env) });
-    const base = baseUrl(request, env);
+    const base = emailBaseUrl(request, env);
 
     if (input.dryRun) {
       return jsonResponse({ ok: true, dryRun: true, subject: draft.subject, html: draft.toEmailHtml({ baseUrl: base }) });

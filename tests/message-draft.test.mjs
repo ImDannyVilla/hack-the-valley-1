@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 import worker from '../worker.js';
-import { MESSAGE_FIELDS, MESSAGE_IMAGE_WIDTH, messageBodyHtml } from '../functions/_shared/message-format.js';
+import { MESSAGE_FIELDS, MESSAGE_IMAGE_WIDTH, fillContactFields, messageBodyHtml } from '../functions/_shared/message-format.js';
 import {
   MESSAGE_IMAGE_MAX_BYTES,
   MessageDraft,
@@ -11,11 +11,15 @@ import {
   createResendDraft,
   messageImageKey,
   prepareMessageImage,
+  sendMessageDraft,
 } from '../functions/_lib/domain/message-draft.js';
+import { sponsorHash } from '../functions/_lib/domain/sponsorships.js';
 import * as messageEditor from '../public/admin-message-editor.js';
 import * as messageDraftComposer from '../public/admin-message-draft.js';
 import { onRequestPost, onRequest } from '../functions/api/admin/message-drafts/index.js';
 import { onRequestGet as getAudience } from '../functions/api/admin/message-drafts/audience.js';
+import { onRequestPost as sendRoute } from '../functions/api/admin/message-drafts/send.js';
+import { onRequestPost as testRoute } from '../functions/api/admin/message-drafts/test.js';
 import { BlogPost } from '../functions/_lib/domain/blog-post.js';
 import { createSponsorshipDb, DEMO_USERS } from './helpers/sponsorship-db.mjs';
 import { createFakeResend } from './helpers/fake-resend.mjs';
@@ -683,6 +687,158 @@ test("a long post title or subject is shortened to fit Resend's 70-character nam
   assert.ok(emoji.name.length <= 70 && emoji.name.isWellFormed(), `an emoji at the cut is not split: ${emoji.name}`);
 });
 
+// --- sending from admin, against a real database -----------------------------
+
+const sendAudits = (db) => db
+  .prepare("SELECT actor_user_id, target_type, target_id, metadata_json FROM audit_events WHERE action = 'message_draft.send' ORDER BY rowid")
+  .all()
+  .then(({ results }) => results);
+const HACK_HOURS = () => new MessageDraft({ subject: 'Hack Hours is back', message: 'See you Saturday.' });
+const sendOnce = (db, resend, { now, fetcher = resend.fetch } = {}) => sendMessageDraft(db, HACK_HOURS(), {
+  actorUserId: ACTOR, key: DRAFT_KEY, segmentId: AUDIENCE, baseUrl: 'https://hackthevalley.org', env: RESEND_ENV, fetcher, now,
+});
+
+test('sending creates the broadcast with send: true in one request, never twice, and audits it once', async (t) => {
+  const db = await receiptsDb(t);
+  const resend = createFakeResend();
+  const sent = await sendOnce(db, resend);
+  assert.equal(sent.status, 'queued');
+  assert.equal(sent.replayed, false);
+  const creates = resend.calls.filter((call) => call.method === 'POST');
+  assert.deepEqual(creates.map((call) => [call.path, call.body.send, call.body.segment_id]), [['/broadcasts', true, AUDIENCE]]);
+  assert.ok(!resend.calls.some((call) => call.path.endsWith('/send')), 'no separate send step that could repeat');
+
+  const retry = await sendOnce(db, resend);
+  assert.equal(retry.replayed, true);
+  assert.equal(retry.broadcastId, sent.broadcastId);
+  assert.equal(createCalls(resend), 1, 'a retry never sends again');
+  const audits = await sendAudits(db);
+  assert.deepEqual(audits.map((row) => [row.actor_user_id, row.target_type, row.target_id]), [[ACTOR, 'resend_broadcast', sent.broadcastId]]);
+  assert.deepEqual(JSON.parse(audits[0].metadata_json), { subject: 'Hack Hours is back', name: sent.name, segmentId: AUDIENCE, postSlug: null, targetType: 'resend_broadcast', targetId: sent.broadcastId });
+});
+
+test('a send with a lost response is found in Resend on retry: not sent again, audited once', async (t) => {
+  const db = await receiptsDb(t);
+  const resend = createFakeResend();
+  resend.nextCreate = 'lose';
+  await assert.rejects(sendOnce(db, resend), (error) => error.status === 502 && /didn't confirm the send/.test(error.message) && /can't go out twice/.test(error.message));
+  assert.equal(resend.broadcasts[0].status, 'queued', 'Resend did send it');
+  assert.equal((await sendAudits(db)).length, 0);
+
+  const retry = await sendOnce(db, resend);
+  assert.equal(retry.replayed, true);
+  assert.equal(retry.status, 'queued');
+  assert.equal(createCalls(resend), 1);
+  assert.equal((await sendAudits(db)).length, 1);
+});
+
+test('a send is recorded with its audit event or not at all, so a failed audit write is recorded on retry', async (t) => {
+  const db = await receiptsDb(t);
+  const resend = createFakeResend();
+  await db.exec("CREATE TRIGGER fail_send_audit BEFORE INSERT ON audit_events WHEN NEW.action = 'message_draft.send' BEGIN SELECT RAISE(ABORT, 'audit store unavailable'); END");
+  await assert.rejects(sendOnce(db, resend), (error) => error.status === 500 && /Resend is sending/.test(error.message) && /Don't send it again/.test(error.message));
+  assert.equal((await storedReceipt(db)).status, 'pending', 'the receipt was not recorded without its audit event');
+  await db.exec('DROP TRIGGER fail_send_audit');
+
+  const retry = await sendOnce(db, resend);
+  assert.equal(retry.replayed, true);
+  assert.equal(createCalls(resend), 1);
+  assert.equal((await sendAudits(db)).length, 1);
+});
+
+test('a retry racing the original send records it, and its audit event, once', async (t) => {
+  const db = await receiptsDb(t);
+  const resend = createFakeResend();
+  let retry = null;
+  // The retry lands after Resend sent it and before the original records it.
+  const racing = async (url, init = {}) => {
+    const response = await resend.fetch(url, init);
+    if (init.method === 'POST' && !retry) retry = await sendOnce(db, resend);
+    return response;
+  };
+  const original = await sendOnce(db, resend, { fetcher: racing });
+  assert.equal(retry.replayed, true);
+  assert.equal(original.replayed, false);
+  assert.equal(original.broadcastId, retry.broadcastId);
+  assert.equal(createCalls(resend), 1);
+  assert.equal((await sendAudits(db)).length, 1);
+});
+
+test('a send Resend refuses (4xx) releases the key and is not audited', async (t) => {
+  const db = await receiptsDb(t);
+  const resend = createFakeResend();
+  resend.nextCreate = 'reject';
+  await assert.rejects(sendOnce(db, resend), (error) => error.status === 502 && /HTTP 422/.test(error.message));
+  assert.equal(await storedReceipt(db), null);
+  assert.equal((await sendAudits(db)).length, 0);
+});
+
+test("a draft's key is never reused to send it", async (t) => {
+  const db = await receiptsDb(t);
+  const resend = createFakeResend();
+  await createDraft(db, resend);
+  await assert.rejects(sendOnce(db, resend), (error) => error.status === 409 && /already used for a different message/.test(error.message));
+  assert.equal(createCalls(resend), 1, 'only the draft was created; nothing was sent');
+});
+
+test('the send route needs a signed-in admin, an Idempotency-Key, and the audience that was shown', async (t) => {
+  const db = await receiptsDb(t);
+  await db.prepare('INSERT INTO user_sessions(id,user_id,token_hash,created_at,expires_at) VALUES(?,?,?,?,?)')
+    .bind('session-alex', ACTOR, await sponsorHash('token-alex'), '2026-01-01', '2099-01-01').run();
+  const resend = createFakeResend();
+  const body = { subject: 'Hack Hours is back', message: 'See you Saturday.', segmentId: AUDIENCE };
+  const call = (input, { cookie = 'htv_session=token-alex', key = DRAFT_KEY } = {}) => sendRoute({
+    request: new Request('https://hackthevalley.org/api/admin/message-drafts/send', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...(cookie ? { cookie } : {}), ...(key ? { 'idempotency-key': key } : {}) },
+      body: JSON.stringify(input),
+    }),
+    env: { HTV_DB: db, ...RESEND_ENV },
+    fetch: resend.fetch,
+  });
+  assert.equal((await call(body, { cookie: null })).status, 401);
+  assert.equal((await call(body, { key: null })).status, 400);
+  assert.equal((await call({ ...body, segmentId: 'seg_old' })).status, 409);
+  assert.equal(createCalls(resend), 0, 'nothing went out');
+
+  const sent = await call(body);
+  assert.equal(sent.status, 200);
+  const data = await sent.json();
+  assert.equal(data.status, 'queued');
+  assert.match(data.name, REF_NAME('Email: Hack Hours is back'));
+  assert.equal(createCalls(resend), 1);
+  assert.equal((await worker.fetch(new Request('https://hackthevalley.org/api/admin/message-drafts/send', { method: 'POST' }), { HTV_DB: {} })).status, 401, 'routed by the worker');
+});
+
+// --- a test email to yourself ---------------------------------------------------
+
+test('a test email goes only to the signed-in admin, with the fields filled in from their account', async () => {
+  const resend = createFakeResend();
+  const response = await testRoute({
+    request: draftRequest({ subject: 'Hack Hours is back', message: 'Hi {{{contact.first_name|there}}}, see you Saturday.' }, { cookie: 'htv_session=tok' }),
+    env: { HTV_DB: adminDb(), ...RESEND_ENV },
+    fetch: resend.fetch,
+  });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).to, 'admin@example.com');
+  assert.deepEqual(resend.calls.map((call) => [call.method, call.path]), [['POST', '/emails']], 'never a broadcast');
+  const [email] = resend.emails;
+  assert.deepEqual(email.to, ['admin@example.com']);
+  assert.equal(email.from, 'HTV <a@b.co>');
+  assert.equal(email.subject, '[Test] Hack Hours is back');
+  assert.match(email.html, /Hi Admin, see you Saturday\./);
+  assert.match(email.html, /href="https:\/\/hackthevalley\.org\/"[^>]*>Unsubscribe/);
+  assert.doesNotMatch(email.html, /\{\{\{/, 'no raw Resend fields');
+  assert.equal((await testRoute({ request: draftRequest({ subject: 's', message: 'm' }), env: { HTV_DB: {}, ...RESEND_ENV }, fetch: resend.fetch })).status, 401);
+  assert.equal((await worker.fetch(new Request('https://hackthevalley.org/api/admin/message-drafts/test', { method: 'POST' }), { HTV_DB: {} })).status, 401, 'routed by the worker');
+});
+
+test('fillContactFields fills fields the way Resend does, with fallbacks', () => {
+  assert.equal(fillContactFields('Hi {{{contact.first_name|there}}} ({{{contact.email}}})', { first_name: '', email: 'a@b.co' }), 'Hi there (a@b.co)');
+  assert.equal(fillContactFields('{{{contact.first_name|there}}} {{{contact.last_name}}}', { first_name: '<Al>' }), '&lt;Al&gt; ');
+  assert.equal(fillContactFields('<a href="{{{RESEND_UNSUBSCRIBE_URL}}}">', {}, { unsubscribeUrl: 'https://hackthevalley.org/' }), '<a href="https://hackthevalley.org/">');
+});
+
 // --- admin UI --------------------------------------------------------------
 
 const adminHtml = () => readFileSync(new URL('../public/admin.html', import.meta.url), 'utf8');
@@ -691,13 +847,15 @@ const editorJs = () => readFileSync(new URL('../public/admin-message-editor.js',
 // The composer's pure helpers live in two modules: the shared editor and the email composer.
 const composer = { ...messageEditor, ...messageDraftComposer };
 
-test('admin page exposes a draft-only message draft composer', () => {
+test('admin page exposes an email composer that tests, sends after a typed confirmation, or drafts', () => {
   const html = adminHtml();
   const start = html.indexOf('id="message-draft"');
   const section = html.slice(start, html.indexOf('</section>', start));
   assert.ok(start > 0, 'missing message draft section');
   assert.match(section, /data-admin-section="email"/);
-  assert.match(section, /Email draft/);
+  assert.match(section, /<h2[^>]*>Email<\/h2>/);
+  assert.match(section, /id="message-draft-test"[^>]*>Send me a test</);
+  assert.match(section, /id="message-draft-send"[^>]*>Send now</);
   assert.match(section, /id="message-draft-start"[^>]*>\s*<option value="">Blank message<\/option>/);
   assert.match(section, /id="message-draft-editor" contenteditable="true"/);
   assert.doesNotMatch(section, /<textarea/);
@@ -709,13 +867,22 @@ test('admin page exposes a draft-only message draft composer', () => {
   const js = composerJs();
   assert.match(js, /postJson\('\/api\/admin\/message-drafts'/);
   assert.match(js, /fetch\('\/api\/admin\/message-drafts\/audience'/);
-  assert.match(js, /payload\(\{ segmentId: audience\.segmentId \}\)/, 'a create names the audience that was shown');
-  assert.match(js, /Nothing will be sent or scheduled from HTV admin/);
-  assert.match(js, /'Idempotency-Key': key/);
+  assert.match(js, /payload\(\{ segmentId: audience\.segmentId \}\)/, 'a send or draft names the audience that was shown');
+  assert.match(js, /handOff\('\/api\/admin\/message-drafts\/send'\)/);
+  assert.match(js, /postJson\('\/api\/admin\/message-drafts\/test', payload\(\)\)/);
+  assert.match(js, /window\.prompt\([^)]*Type SEND to confirm/);
+  assert.match(js, /if \(!isSendConfirmation\(typed\)\)/);
+  assert.match(js, /This only creates the draft; nothing is sent/);
+  assert.match(js, /'Idempotency-Key': requestKeys\.key\('POST', path, JSON\.stringify\(body\)\)/);
   for (const source of [section, js]) {
-    assert.doesNotMatch(source, /Send now|Schedule send|scheduledAt|sendNow/);
+    assert.doesNotMatch(source, /Schedule send|scheduledAt|scheduled_at/, 'nothing is scheduled from admin');
     assert.doesNotMatch(source, /placeholder segment|Recipient placeholder|change recipients/i, 'the audience is real, not a placeholder');
   }
+});
+
+test('sending needs the admin to type SEND', () => {
+  for (const typed of ['SEND', 'send', '  Send ']) assert.equal(composer.isSendConfirmation(typed), true, typed);
+  for (const typed of ['', 'yes', 'SEND IT', null, undefined]) assert.equal(composer.isSendConfirmation(typed), false, String(typed));
 });
 
 test('the composer labels the audience with its size', () => {
